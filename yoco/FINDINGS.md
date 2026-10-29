@@ -38,3 +38,10 @@
 - yoco-handoff (real DUST, 32 handoff draws): DIVERGED at step 128.
   200-step diag (val@200): vjp no-handoff 3.52 | handoff h128 3.77 | h512 3.59 | h32 lr0.15 4.60.
   => shared noisy g_X makes the handoff recipe worse than plain vjp even with 512 extra draws.
+- gpt-vjp 2.843 (gain 0.511) vs gpt-dust 3.115: -0.272. Same as yoco (-0.265). Not YOCO-specific.
+  yoco-vjp 2.863 vs gpt-vjp 2.843: YOCO no better than GPT under DUST.
+
+## Cost (yoco/bench_local.py, in-process medians per step, shared GPU)
+- L4: direct draws 0.95 s | ZO local (q,k,v,gate,ve) 63 ms | exact local VJP 11 ms | ZO head 203 ms | exact head 4 ms
+- L8: direct 3.23 s | ZO local 217 ms | VJP 29 ms | ZO head 214 ms | exact head 5 ms
+- "head = 77% of budget": 77% of draw COUNT; ~17% of step time at L4, ~6% at L8.

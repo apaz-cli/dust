@@ -9,7 +9,9 @@ run() { name=$1; shift; out=runs/q2/$name; [ -f $out/step3000.pt ] && return; rm
   echo "$(date +%T) start $name"; $PY yoco/train.py --output $out "$@" > $out.log 2>&1; echo "$(date +%T) done $name: $(tail -1 $out.log)"; }
 run yoco-vjp-s7         --arch yoco --method dust --local vjp --seed 7
 run gpt-vjp-s7          --arch gpt  --method dust --local vjp --seed 7
-run L8-gpt-dust         --arch gpt  --method dust --n-layer 8 --n-embd 512
+run gpt-vjp-head       --arch gpt  --method dust --local vjp --head exact
+run yoco-vjp-head      --arch yoco --method dust --local vjp --head exact
+run L8-gpt-dust        --arch gpt  --method dust --n-layer 8 --n-embd 512
 run L8-gpt-vjp          --arch gpt  --method dust --local vjp --n-layer 8 --n-embd 512
 run L8-yoco-vjp         --arch yoco --method dust --local vjp --n-layer 8 --n-embd 512
 run gpt-oracle-attn     --arch gpt  --method dust --oracle attn
