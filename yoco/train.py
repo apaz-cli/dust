@@ -39,6 +39,9 @@ def main():
     p.add_argument('--handoff-draws', type=int)
     p.add_argument('--gamma', type=float)
     p.add_argument('--population', type=int, default=256, choices=[256, 1024, 4096])
+    p.add_argument('--res-gamma', type=float, default=0.0, help='discounted later-loss credit for early-block sites')
+    p.add_argument('--res-blocks', type=int, default=2)
+    p.add_argument('--emb-scale', type=int, default=1, help='multiply the token-embedding draws')
     p.add_argument('--direct-scale', type=int, default=1, help='multiply writer and hidden draws')
     p.add_argument('--flat-alloc', action='store_true', help='same writer/hidden draws in every block (same total)')
     p.add_argument('--fp32', action='store_true', help='DUST forwards in fp32 activations (TF32 matmuls), not bf16')
@@ -47,6 +50,7 @@ def main():
     p.add_argument('--local-scale', type=int, default=1, help='multiply the ZO local (q, k, v, gate, ve) draws')
     p.add_argument('--head-div', type=int, default=1, help='divide the ZO head draws')
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
+    p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
     p.add_argument('--oracle', nargs='*', default=[], help='groups given their noise-free expected update')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
@@ -71,7 +75,8 @@ def main():
                        local={k: v * args.local_scale for k, v in settings.local.items()},
                        head=settings.head // args.head_div)
     settings = replace(settings, writers=[w * args.direct_scale for w in settings.writers],
-                       hidden=[w * args.direct_scale for w in settings.hidden])
+                       hidden=[w * args.direct_scale for w in settings.hidden],
+                       embedding=settings.embedding * args.emb_scale)
     if args.flat_alloc:
         nrep = settings.nrep
         flat = lambda xs: [max(nrep, round(sum(xs) / len(xs) / nrep) * nrep)] * len(xs)
@@ -87,7 +92,8 @@ def main():
     if args.method == 'dust':
         estimator = DustX(model, settings, args.seed, head=args.head, local=args.local,
                           handoff=args.handoff, handoff_draws=args.handoff_draws, oracle=args.oracle,
-                          credit=args.credit, attn_c=args.attn_c)
+                          credit=args.credit, attn_c=args.attn_c,
+                          res_gamma=args.res_gamma, res_blocks=args.res_blocks)
         if args.fp32:  # removes bf16 rounding from the loss differences
             from contextlib import nullcontext
             estimator.autocast = nullcontext
@@ -98,6 +104,9 @@ def main():
         model.requires_grad_(True)
         if args.method == 'ed':  # noise-free DUST: backprop of the expected DUST update
             expected.install(model, settings.gamma, cross_full=args.handoff)
+            if args.ed_own_layers is not None:
+                for i, blk in enumerate(model.transformer.h):
+                    blk.attn.ed_stream = 'own' if i in args.ed_own_layers else 'full'
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'config.json').write_text(json.dumps(dict(
         args={k: str(v) for k, v in vars(args).items()}, model=asdict(config), recipe=asdict(settings),

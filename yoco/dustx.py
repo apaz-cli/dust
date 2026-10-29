@@ -23,8 +23,9 @@ from model import attention, apply_rotary_emb, has_ve, norm
 
 class DustX(DUST):
     def __init__(self, model, settings, seed=42, head='zo', local='zo', handoff=False, handoff_draws=None,
-                 oracle=(), credit='gamma', attn_c=0.01):
+                 oracle=(), credit='gamma', attn_c=0.01, res_gamma=0.0, res_blocks=2):
         super().__init__(model, settings, seed)
+        self.res_gamma, self.res_blocks = res_gamma, res_blocks
         self.credit_mode, self.attn_c = credit, attn_c
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
@@ -45,6 +46,48 @@ class DustX(DUST):
             X = self.model(x, stop_at_handoff=True).float()
         g = self.score.repeat(x.shape[0] // self.batch, 1, 1)
         return (X * g).sum(-1)
+
+    def res_site(self, site):
+        if site == 'transformer.wte':
+            return True
+        if site.startswith('o@'):
+            return int(site[2:]) < self.res_blocks
+        if site.startswith('transformer.h.'):
+            return int(site.split('.')[2]) < self.res_blocks
+        return False
+
+    def direct_errors(self, sites, draws, sigma):  # DUST.direct_errors plus optional residual credit
+        """One-sided loss drops, centered across each chunk of draws. """
+        n = self.settings.nrep
+        x, y = self.x.repeat(n, 1), self.y.repeat(n, 1)
+        width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
+        errors = {s: torch.zeros(self.batch, self.length, width(s), device=self.device) for s in sites}
+
+        for _ in range(draws // n):
+            noise = {s: self.noise(n * self.batch, self.length, width(s)) for s in sites}
+            self.jitter = {s: sigma * a for s, a in noise.items()}
+            try:
+                perturbed_loss = self.losses(x, y).view(n, self.batch, self.length)
+            finally:
+                self.jitter = {}
+
+            reward = self.clean_loss.unsqueeze(0) - perturbed_loss
+            if n > 1:
+                reward = reward - reward.mean(0, keepdim=True)
+            if self.res_gamma and any(self.res_site(s) for s in sites):
+                # credit token t's jitter with gamma-discounted later token losses (as DUST does for k/v)
+                t = self.length
+                pos = torch.arange(t, device=self.device)
+                lag = pos[None, :] - pos[:, None]  # [t, u]
+                K = (lag >= 0).float() * self.res_gamma ** lag.clamp(min=0).float()
+                reward = torch.einsum('nbu,tu->nbt', reward, K)
+            for site, a in noise.items():
+                errors[site] -= torch.einsum(
+                    'nbt,nbtd->btd', reward.to(self.dtype),
+                    a.view(n, self.batch, self.length, -1),
+                ).float() / sigma
+
+        return {s: error / draws for s, error in errors.items()}
 
     # ---- head ----------------------------------------------------------------------------------
     def exact_head_error(self):

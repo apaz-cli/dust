@@ -112,3 +112,13 @@
 - YOCO cache k 11.8, v 2.9 (like GPT's deep k/v). wte .82 (YOCO) / .76 (GPT): worst direct site (also bias^2 .5, 10 draws).
 - yoco-local16-hd4 3.003 (-0.125, 1897 s). yoco-fp32-local4-hub4 2.842 (-0.286, gain .456, 2023 s = 1.49x stock):
   derivative-free, matches the VJP diagnostic (2.855).
+- gpt-fp32 3.059 vs gpt-dust 3.115 (-0.056). yoco-dust seed 7: 3.135 -> stock YOCO 3.131 +- .005 (n=2).
+
+## Where the bias lives (noise-free, own-token streams only in chosen layers, gamma 1, lr .2, seeds 42/7; cost vs bp)
+- GPT single: L0 +.011, L1 +.028, L2 -.007, L3 0. YOCO single: L0 noisy (-.044/+.028), L1 +.037.
+- GPT pairs: [0,1] +.09 | [2,3] +.009 | [0,1,2] +.11 | [1,2,3] +.041 | all ~+.10.
+- => bias is superadditive and lives in the first two layers jointly (cross-token circuits need a 2-layer credit chain).
+   In YOCO those are the self-decoder, which YOCO does not change.
+- Residual credit (res_gamma on blocks 0-1 + wte), per-step error vs TRUE gradient (fp32, stock draws): monotone worse
+  with res_gamma in both bp- and DUST-trained YOCO (block0 c_proj err 2.20 -> 2.84 (.5) -> 5.6 (.8) on bp-trained).
+  Per-step metric undervalues bias (momentum averages ~20 steps); training arms res .5/.8 queued.
