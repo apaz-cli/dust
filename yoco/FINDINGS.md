@@ -110,3 +110,5 @@
 - residual-stream sites (writers, c_fc, c_q): block0 ~.09-.11 both archs; block1 .001-.005; deeper GPT <=.001, YOCO cross 0 exactly.
 - k/v weights: 3-45 (GPT b0 k 19.9 v 21.2, b1 k 30.6, b2 k 22.9, b3 k 8.4); YOCO self b0 k 23.3 v 24.7, b1 k 44.7.
 - YOCO cache k 11.8, v 2.9 (like GPT's deep k/v). wte .82 (YOCO) / .76 (GPT): worst direct site (also bias^2 .5, 10 draws).
+- yoco-local16-hd4 3.003 (-0.125, 1897 s). yoco-fp32-local4-hub4 2.842 (-0.286, gain .456, 2023 s = 1.49x stock):
+  derivative-free, matches the VJP diagnostic (2.855).
