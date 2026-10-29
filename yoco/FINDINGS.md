@@ -97,3 +97,11 @@
   -> in the regime DUST actually trains in, bf16 rounding dominates deep sites ~100x.
 - backprop-trained YOCO: bias^2 b0 .17-.30, b1 .01-.05, cross 0, wte .50; noise/draw 55-345; rounding 2-15.
 - Per step noise >> bias everywhere; bias persists across steps, noise averages.
+- yoco-local4 3.034 (-0.094, gain .410) | yoco-fp32-local4 2.977 (-0.151, gain .442, 1745 s vs 1360 s stock).
+
+## Orthogonal probe directions (yoco/bench_orthogonal.py; attn.c_proj, d=256, central differences, cos to own-token error)
+- sigma 0.02 + TF32 is rounding-limited; use sigma 0.2. fp32 ('highest'): Gaussian N=64 .447, N=256 .706 (= sqrt(N/(N+d)));
+  orthogonal N=64 .50 (= sqrt(N/d)), N=256 (full basis) 1.000 at every site of DUST-trained YOCO.
+- bp-trained (context-using): full basis gives YOCO .958/.998/1.000/1.000, GPT .963/.998/.999/1.000 by block
+  -> leakage only blocks exactness at block 0 (1-cos^2 ~ 8%). TF32 costs a little at depth (.935 at YOCO block 3).
+- Below a full basis the gain is cos^2 x (1 + N/d): 4-15% at stock budgets; decisive only when draws per site >= width.

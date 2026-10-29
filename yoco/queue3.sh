@@ -8,3 +8,5 @@ run() { name=$1; shift; out=runs/q3/$name; [ -f $out/step3000.pt ] && return; rm
   echo "$(date +%T) start $name"; $PY yoco/train.py --output $out "$@" > $out.log 2>&1; echo "$(date +%T) done $name: $(tail -1 $out.log)"; }
 run yoco-fp32-local4-flat --arch yoco --method dust --fp32 --local-scale 4 --flat-alloc
 run yoco-fp32-flat        --arch yoco --method dust --fp32 --flat-alloc
+run yoco-direct2          --arch yoco --method dust --direct-scale 2
+run yoco-fp32-local16-hd4 --arch yoco --method dust --fp32 --local-scale 16 --head-div 4

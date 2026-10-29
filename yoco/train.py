@@ -39,6 +39,7 @@ def main():
     p.add_argument('--handoff-draws', type=int)
     p.add_argument('--gamma', type=float)
     p.add_argument('--population', type=int, default=256, choices=[256, 1024, 4096])
+    p.add_argument('--direct-scale', type=int, default=1, help='multiply writer and hidden draws')
     p.add_argument('--flat-alloc', action='store_true', help='same writer/hidden draws in every block (same total)')
     p.add_argument('--fp32', action='store_true', help='DUST forwards in fp32 activations (TF32 matmuls), not bf16')
     p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
@@ -69,6 +70,8 @@ def main():
     settings = replace(settings, hubs=[h * args.hub_scale for h in settings.hubs],
                        local={k: v * args.local_scale for k, v in settings.local.items()},
                        head=settings.head // args.head_div)
+    settings = replace(settings, writers=[w * args.direct_scale for w in settings.writers],
+                       hidden=[w * args.direct_scale for w in settings.hidden])
     if args.flat_alloc:
         nrep = settings.nrep
         flat = lambda xs: [max(nrep, round(sum(xs) / len(xs) / nrep) * nrep)] * len(xs)
