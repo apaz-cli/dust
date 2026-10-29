@@ -25,3 +25,16 @@
 - Real DUST gpt: 3.115.  => bias costs ~0.1 nat, draw noise ~1.0 nat.
 - Context: ed gamma0.98 gain 0.686 (bp 0.701), ed gamma0 gain 0.398 flat after 32 == real DUST's profile.
   Hypothesis: in real DUST the k/v credit is lost to noise in the local ZO draws.
+- lr 0.2 (bp: gpt 1.920, yoco 1.923): ed gpt g0 2.505 | g0.98 2.036 | g0.995 2.025 | g0.999 2.021 | g1 2.022
+  ed yoco g0.98 2.045 | g1 2.021 | g1+handoff 1.997 | g0 2.495
+  => bias cost vs bp: gpt stock 0.116, yoco stock 0.122, yoco vjp 0.098, yoco handoff 0.074.
+
+## Real DUST, L4, seed 42, lr 0.25 (q1)
+- gpt-dust 3.115 (context gain 0.389) | yoco-dust 3.128 (gain 0.364)
+- yoco-vjp 2.863 (gain 0.524, loss still falling at 256-512): exact local attention VJP instead of ZO local draws: -0.265 nat.
+
+## L8 noise-free (seed 42): bp gpt 1.866/1.938 (lr .1/.2), bp yoco 1.866/1.808
+- ed gpt g.98 1.963/1.896 | g1 1.951/1.875 | yoco g.98 1.976/2.030 | yoco g1 1.961/? | yoco handoff 1.952/1.968
+- yoco-handoff (real DUST, 32 handoff draws): DIVERGED at step 128.
+  200-step diag (val@200): vjp no-handoff 3.52 | handoff h128 3.77 | h512 3.59 | h32 lr0.15 4.60.
+  => shared noisy g_X makes the handoff recipe worse than plain vjp even with 512 extra draws.
