@@ -129,3 +129,6 @@
   n_self=1 does not remove bias (the cache stream is own-token too: still a 2-step chain). Default split is fine.
 - (8x hub: yoco-fp32-local4-hub8 2.832 vs hub4 2.842; diminishing.)
 - Note: DustX.zo_self_local assumes even n_self (has_ve parity); fix before real-DUST runs with odd n_self.
+- Residual credit in training: yoco-fp32-local4-hub4-res5 2.907 vs 2.842 without (+0.065, gain .406). Variance cost wins;
+  early-layer bias (~.09 noise-free) is not recoverable by a gamma discount at stock draws.
+- Compute control: yoco-direct2 (2x writer+hidden draws) 3.068 at 2067 s vs fp32-local4-hub4 2.842 at 2023 s -> -0.226 at equal wall time.
