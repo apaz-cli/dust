@@ -132,3 +132,5 @@
 - Residual credit in training: yoco-fp32-local4-hub4-res5 2.907 vs 2.842 without (+0.065, gain .406). Variance cost wins;
   early-layer bias (~.09 noise-free) is not recoverable by a gamma discount at stock draws.
 - Compute control: yoco-direct2 (2x writer+hidden draws) 3.068 at 2067 s vs fp32-local4-hub4 2.842 at 2023 s -> -0.226 at equal wall time.
+- yoco-fp32-local4-hub4-emb4 (4x embedding draws): 2.777 (-0.065 vs 2.842), 2128 s.
+- Seed 7 of fp32-local4-hub4: 2.885 -> best recipe 2.863 +- .03 (n=2) vs stock 3.131 +- .005.

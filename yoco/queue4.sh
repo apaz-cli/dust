@@ -8,4 +8,4 @@ run() { name=$1; shift; out=runs/q4/$name; [ -f $out/step3000.pt ] && return; rm
   echo "$(date +%T) start $name"; $PY yoco/train.py --output $out "$@" > $out.log 2>&1; echo "$(date +%T) done $name: $(tail -1 $out.log)"; }
 run yoco-fp32-local4-hub4-s7  --arch yoco --method dust --fp32 --local-scale 4 --hub-scale 4 --seed 7
 run L8-yoco-dust         --arch yoco --method dust --n-layer 8 --n-embd 512
-run L8-yoco-fp32-local4-hub4  --arch yoco --method dust --fp32 --local-scale 4 --hub-scale 4 --n-layer 8 --n-embd 512
+run L8-yoco-fp32-local4-hub4-emb4  --arch yoco --method dust --fp32 --local-scale 4 --hub-scale 4 --emb-scale 4 --n-layer 8 --n-embd 512
