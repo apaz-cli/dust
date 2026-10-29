@@ -122,3 +122,10 @@
 - Residual credit (res_gamma on blocks 0-1 + wte), per-step error vs TRUE gradient (fp32, stock draws): monotone worse
   with res_gamma in both bp- and DUST-trained YOCO (block0 c_proj err 2.20 -> 2.84 (.5) -> 5.6 (.8) on bp-trained).
   Per-step metric undervalues bias (momentum averages ~20 steps); training arms res .5/.8 queued.
+
+## YOCO split depth (L4, lr .2, seeds 42/7): backprop / noise-free (gamma 1, own streams incl. cache) / bias cost
+- n_self 1: 1.950 / 2.053 / .103 | n_self 2: 1.916 / 2.020 / .104 | n_self 3: 1.892 / 2.019 / .127
+- deeper self-decoder helps backprop; noise-free DUST is flat 2->3, so bias grows with self-decoder depth.
+  n_self=1 does not remove bias (the cache stream is own-token too: still a 2-step chain). Default split is fine.
+- (8x hub: yoco-fp32-local4-hub8 2.832 vs hub4 2.842; diminishing.)
+- Note: DustX.zo_self_local assumes even n_self (has_ve parity); fix before real-DUST runs with odd n_self.

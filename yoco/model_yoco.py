@@ -123,11 +123,11 @@ class YOCO(GPT):
         return logits
 
 
-def build(arch, config, device, seed):
+def build(arch, config, device, seed, n_self=None):
     """make_model for either architecture: output projections at std 1.5 / sqrt(fan_in), as dust.make_model."""
     torch.manual_seed(seed)
     with torch.device('meta'):
-        model = GPT(config) if arch == 'gpt' else YOCO(config)
+        model = GPT(config) if arch == 'gpt' else YOCO(config, n_self=n_self)
     model.to_empty(device=device)
     model.init_weights()
     with torch.no_grad():

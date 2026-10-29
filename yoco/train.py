@@ -51,6 +51,7 @@ def main():
     p.add_argument('--head-div', type=int, default=1, help='divide the ZO head draws')
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
+    p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
     p.add_argument('--oracle', nargs='*', default=[], help='groups given their noise-free expected update')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
@@ -86,7 +87,7 @@ def main():
     order = torch.randperm(len(train), generator=torch.Generator().manual_seed(args.seed + 1))
     train = train[order]
 
-    model = build(args.arch, config, device, args.seed)
+    model = build(args.arch, config, device, args.seed, n_self=args.n_self)
     optimizer = make_optimizer(model, settings)
     estimator = None
     if args.method == 'dust':
