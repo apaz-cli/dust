@@ -39,6 +39,8 @@ def main():
     p.add_argument('--handoff-draws', type=int)
     p.add_argument('--gamma', type=float)
     p.add_argument('--population', type=int, default=256, choices=[256, 1024, 4096])
+    p.add_argument('--local-scale', type=int, default=1, help='multiply the ZO local (q, k, v, gate, ve) draws')
+    p.add_argument('--head-div', type=int, default=1, help='divide the ZO head draws')
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--oracle', nargs='*', default=[], help='groups given their noise-free expected update')
     p.add_argument('--n-layer', type=int, default=4)
@@ -60,7 +62,9 @@ def main():
     n = config.n_layer
     settings = replace(settings, writers=settings.writers[:n], hidden=settings.hidden[:n], hubs=settings.hubs[:n],
                        lr=args.lr, **({'gamma': args.gamma} if args.gamma is not None else {}))
-    settings = replace(settings, hubs=[h * args.hub_scale for h in settings.hubs])
+    settings = replace(settings, hubs=[h * args.hub_scale for h in settings.hubs],
+                       local={k: v * args.local_scale for k, v in settings.local.items()},
+                       head=settings.head // args.head_div)
     train = torch.load(args.data_dir / 'train.pt', weights_only=True).long()
     val = torch.load(args.data_dir / 'validation.pt', weights_only=True).long().to(device)
     order = torch.randperm(len(train), generator=torch.Generator().manual_seed(args.seed + 1))

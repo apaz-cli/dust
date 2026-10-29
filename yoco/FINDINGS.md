@@ -54,3 +54,8 @@
 - => noise-free bias cost 0.09-0.13 nat at both sizes; gamma .98->1 buys ~0.02; YOCO / handoff within seed noise.
 - gpt-exacthead (real DUST): 3.116 vs 3.115. No quality change; saves ~17% step time at L4.
 - seed 7: yoco-vjp 2.847, gpt-vjp 2.864 -> yoco-vjp 2.855+-.011, gpt-vjp 2.853+-.015 (n=2).
+
+## Constraint from the user (07:15): no derivatives anywhere. The local VJP, exact head, cache pullback and
+## handoff pullback are derivative methods -> diagnostics only, not proposals. Derivative-free follow-up:
+## more ZO local draws (cheap), fewer ZO head draws. Oracle arms are diagnostics.
+- gpt-vjp-head (diagnostic) 2.780.
