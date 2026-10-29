@@ -79,6 +79,8 @@ def measure(model, probe, seq, K, yoco, autocast):
     probe.leaves.clear()
 
     own = {s: torch.zeros_like(full[s]) for s in full}
+    leak = {s: 0.0 for s in full}
+    ownsq = {s: 0.0 for s in full}
     hand = {s: torch.zeros_like(full[s]) for s in full} if yoco else None
     self_sites = [s for s in full if yoco and (s == 'transformer.wte' or s.startswith('value_embeds')
                   or (s.startswith('transformer.h.') and int(s.split('.')[2]) < model.n_self))]
@@ -89,8 +91,13 @@ def measure(model, probe, seq, K, yoco, autocast):
         with ctx():
             Lk = model(x.expand(k, -1).contiguous(), y.expand(k, -1).contiguous(), loss_reduction='none').float().view(k, -1)
         Lk[ar, tk].sum().backward()
+        before = torch.arange(T, device=x.device)[None, :] < tk[:, None]
         for s in full:
-            own[s][tk] = probe.leaves[s].grad[ar, tk]
+            g = probe.leaves[s].grad
+            own[s][tk] = g[ar, tk]
+            M = g.float().square().sum(-1)  # [k, T]: ||dL_tk / dY_s||^2
+            leak[s] += (M * before).sum().item()
+            ownsq[s] += M[ar, tk].sum().item()
         probe.leaves.clear()
         if yoco:
             with ctx():
@@ -108,7 +115,7 @@ def measure(model, probe, seq, K, yoco, autocast):
         r = dict(wcos_own=F.cosine_similarity(Gt.flatten(), Go.flatten(), 0).item(),
                  miss_own=((Gt - Go).norm() / Gt.norm()).item(),
                  fut=((full[s] - own[s]).square().sum() / full[s].square().sum()).item(),
-                 norm=Gt.norm().item())
+                 norm=Gt.norm().item(), kappa=leak[s] / max(ownsq[s], 1e-30))
         if yoco and s in self_sites:
             Gh = weight_grad(probe, s, hand[s])
             r['wcos_hand'] = F.cosine_similarity(Gt.flatten(), Gh.flatten(), 0).item()

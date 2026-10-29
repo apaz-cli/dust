@@ -105,3 +105,8 @@
 - bp-trained (context-using): full basis gives YOCO .958/.998/1.000/1.000, GPT .963/.998/.999/1.000 by block
   -> leakage only blocks exactness at block 0 (1-cos^2 ~ 8%). TF32 costs a little at depth (.935 at YOCO block 3).
 - Below a full basis the gain is cos^2 x (1 + N/d): 4-15% at stock budgets; decisive only when draws per site >= width.
+
+## Exact leakage kappa (measure_bias.py, bp-trained, 2 seqs): sum_{s<t}||dL_t/dY_s||^2 / ||dL_t/dY_t||^2
+- residual-stream sites (writers, c_fc, c_q): block0 ~.09-.11 both archs; block1 .001-.005; deeper GPT <=.001, YOCO cross 0 exactly.
+- k/v weights: 3-45 (GPT b0 k 19.9 v 21.2, b1 k 30.6, b2 k 22.9, b3 k 8.4); YOCO self b0 k 23.3 v 24.7, b1 k 44.7.
+- YOCO cache k 11.8, v 2.9 (like GPT's deep k/v). wte .82 (YOCO) / .76 (GPT): worst direct site (also bias^2 .5, 10 draws).
