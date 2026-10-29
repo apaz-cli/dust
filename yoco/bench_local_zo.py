@@ -187,6 +187,32 @@ class Reader:
         return est.reshape(b, t, -1) / draws
 
 
+def cache_direct(est, rd, draws, sigma=0.05, n=8, attn_c=0.01, gamma=None):
+    """YOCO only: jitter the raw cache rows, run the model, reward row t with sum_u W_ut (L_u - L'_u).
+    W is attention-matched (mean over cross layers) or gamma^(u-t). One noise stage, no o@ errors."""
+    b, t, h, d = rd.b, rd.t, rd.h, rd.d
+    if gamma is None:
+        W = sum((attn_c * t * rd.probs(i)).clamp(max=1.0) for i in rd.layers) / len(rd.layers)  # [b,h,u,t]
+    else:
+        pos = torch.arange(t, device='cuda')
+        lag = pos[:, None] - pos[None, :]
+        W = ((lag >= 0).float() * gamma ** lag.clamp(min=0).float()).expand(b, h, t, t)
+    x, y = est.x.repeat(n, 1), est.y.repeat(n, 1)
+    out = torch.zeros(b, t, h, d, device='cuda')
+    for _ in range(draws // n):
+        a = torch.randn(n, b, t, h * d, device='cuda')
+        est.jitter = {rd.sitename: sigma * a.view(n * b, t, h * d)}
+        try:
+            L = est.losses(x, y).view(n, b, t)
+        finally:
+            est.jitter = {}
+        r = (L - est.clean_loss.unsqueeze(0))
+        r = r - r.mean(0, keepdim=True)
+        cr = torch.einsum('nbu,bhut->nbth', r, W)
+        out += torch.einsum('nbth,nbthd->bthd', cr, a.view(n, b, t, h, d)) / sigma
+    return out.reshape(b, t, -1) / draws
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--run', required=True)
@@ -194,6 +220,8 @@ def main():
     p.add_argument('--draws', type=int, nargs='+', default=[16, 64, 256])
     p.add_argument('--designs', nargs='+', default=['dense', 'sparse4', 'sparse16', 'anti', 'rad'])
     p.add_argument('--sites', nargs='+', default=None)
+    p.add_argument('--hub-draws', type=int, default=0, help='score against ZO-estimated o@ errors (real pipeline)')
+    p.add_argument('--cache-direct', type=int, nargs='*', default=[], help='draw counts for the direct cache estimator')
     p.add_argument('--modes', nargs='+', default=['gamma0.98'], help='gammaG or attnC credit schemes')
     p.add_argument('--out', required=True)
     args = p.parse_args()
@@ -205,13 +233,21 @@ def main():
     est = DustX(model, recipe('10M', 256))
     est.capture(x, y)
     yoco = hasattr(model, 'n_self')
+    e_ref = e
+    if args.hub_draws:
+        L = model.config.n_layer
+        with torch.no_grad():
+            e = {i: est.direct_errors([f'o@{i}'], args.hub_draws, 0.2 if i < L // 2 else 0.4)[f'o@{i}'] for i in range(L)}
+        for i in range(L):
+            c = F.cosine_similarity(e[i].flatten(), e_ref[i].flatten(), 0).item()
+            print(f'o@{i} estimate vs exact cos {c:.3f}', flush=True)
     sites = args.sites or (['cache', 0, 1] if yoco else [0, 1, 2, 3])
     res = []
     for site in sites:
         site = site if site == 'cache' else int(site)
         for kind in ('k', 'v'):
             rd = Reader(est, site, kind)
-            E = rd.expected(e, 1.0)  # reference: the full local credit
+            E = rd.expected(e_ref, 1.0)  # reference: the full local credit
             GE = est.reassemble(rd.sitename, E)
             for design in args.designs:
               P = int(design[6:]) if design.startswith('sparse') else 1
@@ -227,6 +263,19 @@ def main():
                              cos=F.cosine_similarity(GZ.flatten(), GE.flatten(), 0).item())
                     res.append(r)
                     print(json.dumps(r), flush=True)
+    for kind in ('k', 'v'):
+        rd = Reader(est, 'cache', kind)
+        GE = est.reassemble(rd.sitename, rd.expected(e_ref, 1.0))
+        for N in args.cache_direct:
+            for label, g in (('direct-attn', None), ('direct-g0.98', 0.98)):
+                with torch.no_grad():
+                    Z = cache_direct(est, rd, N, gamma=g)
+                GZ = est.reassemble(rd.sitename, Z)
+                r = dict(site='cache', kind=kind, design=label, mode='-', draws=N,
+                         rel=((GZ - GE).norm() / GE.norm()).item(),
+                         cos=F.cosine_similarity(GZ.flatten(), GE.flatten(), 0).item())
+                res.append(r)
+                print(json.dumps(r), flush=True)
     Path(args.out).write_text(json.dumps(res, indent=1))
 
 

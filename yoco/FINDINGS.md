@@ -59,3 +59,17 @@
 ## handoff pullback are derivative methods -> diagnostics only, not proposals. Derivative-free follow-up:
 ## more ZO local draws (cheap), fewer ZO head draws. Oracle arms are diagnostics.
 - gpt-vjp-head (diagnostic) 2.780.
+
+## Derivative-free local estimator bench (yoco/bench_local_zo.py), bp-trained YOCO, exact own-token o@ errors
+- Stock budget is mostly noise: cache k (12 draws) cos ~0.07, cache v (20) cos ~0.2; dense estimator unbiased (rel ~ 1/sqrt(N)).
+- Designs at 256 draws: sparse position masks (P=4/16/64), antithetic, Rademacher: no gain (sparse worse).
+  => noise is cross-row interference, and isolating rows costs exactly the samples it saves.
+- Credit kernel vs full (gamma=1) local gradient: gamma 1.0 worst (noise), 0.9 best of gammas at small N.
+  Attention-matched credit w_ut = min(1, c*T*P_ut), c=0.01 (forward probabilities only, derivative-free):
+  N=16 cos: cache k .148 (g.98: .072), self0 k .291 (.106), self0 v .366 (.150), self1 v .478 (.194)
+  N=256 cos: cache v .603-.746 (g.98 .590), self0 k .716 (.386), self0 v .786 (.513), self1 v .838 (.641)
+- c in 0.001..0.01 about equal in cos; smaller c shrinks magnitude.
+- Full pipeline (ZO o@ errors, hub draws 6): o@ estimate cos to exact only .02-.10 per step (96 draws: .09-.38).
+  Every local design then has per-step cos ~0 (momentum averages across steps); per-step bench can't rank them.
+- YOCO direct cache scoring (jitter cache rows, reward with attention-weighted later losses, no o@ stage):
+  rel 13-52 (attn) / 44-455 (gamma) vs 5-7 via hub route -> rejected; each token loss carries every read row's jitter.
