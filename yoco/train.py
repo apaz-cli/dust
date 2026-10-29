@@ -39,6 +39,7 @@ def main():
     p.add_argument('--handoff-draws', type=int)
     p.add_argument('--gamma', type=float)
     p.add_argument('--population', type=int, default=256, choices=[256, 1024, 4096])
+    p.add_argument('--flat-alloc', action='store_true', help='same writer/hidden draws in every block (same total)')
     p.add_argument('--fp32', action='store_true', help='DUST forwards in fp32 activations (TF32 matmuls), not bf16')
     p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
     p.add_argument('--attn-c', type=float, default=0.01)
@@ -68,6 +69,10 @@ def main():
     settings = replace(settings, hubs=[h * args.hub_scale for h in settings.hubs],
                        local={k: v * args.local_scale for k, v in settings.local.items()},
                        head=settings.head // args.head_div)
+    if args.flat_alloc:
+        nrep = settings.nrep
+        flat = lambda xs: [max(nrep, round(sum(xs) / len(xs) / nrep) * nrep)] * len(xs)
+        settings = replace(settings, writers=flat(settings.writers), hidden=flat(settings.hidden))
     train = torch.load(args.data_dir / 'train.pt', weights_only=True).long()
     val = torch.load(args.data_dir / 'validation.pt', weights_only=True).long().to(device)
     order = torch.randperm(len(train), generator=torch.Generator().manual_seed(args.seed + 1))

@@ -90,3 +90,10 @@
 - yoco-attn (attention-matched credit, c=.01): 3.170 vs yoco-dust 3.128 (+0.04 worse), gain 0.217.
   Per-step alignment improved on the bench, but credit proportional to current attention cannot teach a query
   to attend somewhere new (rich-get-richer bias). Dropped.
+- yoco-fp32 (TF32 forwards): 3.054 vs 3.128 (-0.074), gain 0.361, +18% wall time.
+
+## Error budget (yoco/error_budget.py; weight space, / ||G_true||^2; noise & rounding per draw; N=16, R=4)
+- DUST-trained YOCO: bias^2 <= .006 (wte .056); noise/draw 30-190; rounding/draw 31 (b0) .. 1330-5458 (b2-b3 writers)
+  -> in the regime DUST actually trains in, bf16 rounding dominates deep sites ~100x.
+- backprop-trained YOCO: bias^2 b0 .17-.30, b1 .01-.05, cross 0, wte .50; noise/draw 55-345; rounding 2-15.
+- Per step noise >> bias everywhere; bias persists across steps, noise averages.
