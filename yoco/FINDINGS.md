@@ -45,3 +45,12 @@
 - L4: direct draws 0.95 s | ZO local (q,k,v,gate,ve) 63 ms | exact local VJP 11 ms | ZO head 203 ms | exact head 4 ms
 - L8: direct 3.23 s | ZO local 217 ms | VJP 29 ms | ZO head 214 ms | exact head 5 ms
 - "head = 77% of budget": 77% of draw COUNT; ~17% of step time at L4, ~6% at L8.
+
+## Seeds (42, 7, 11), yoco/summarize_ed.py -> runs/ed_summary.json
+- L4 best lr 0.2: bp gpt 1.919+-.015, bp yoco 1.926+-.019 | ed gpt g.98 2.048+-.012, g1 2.026+-.004 |
+  ed yoco g.98 2.060+-.021, g1 2.031+-.020, handoff 2.028+-.028
+- L8 lr 0.1 (lr 0.2 unstable at L8: bp sd .04, ed-yoco-g1 s42 diverged at step 10): bp gpt 1.863+-.003, bp yoco 1.860+-.013 |
+  ed gpt g.98 1.968+-.005, g1 1.952+-.002 | ed yoco g.98 1.971+-.005, g1 1.954+-.006, handoff 1.950+-.002
+- => noise-free bias cost 0.09-0.13 nat at both sizes; gamma .98->1 buys ~0.02; YOCO / handoff within seed noise.
+- gpt-exacthead (real DUST): 3.116 vs 3.115. No quality change; saves ~17% step time at L4.
+- seed 7: yoco-vjp 2.847, gpt-vjp 2.864 -> yoco-vjp 2.855+-.011, gpt-vjp 2.853+-.015 (n=2).
