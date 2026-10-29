@@ -39,6 +39,8 @@ def main():
     p.add_argument('--handoff-draws', type=int)
     p.add_argument('--gamma', type=float)
     p.add_argument('--population', type=int, default=256, choices=[256, 1024, 4096])
+    p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
+    p.add_argument('--attn-c', type=float, default=0.01)
     p.add_argument('--local-scale', type=int, default=1, help='multiply the ZO local (q, k, v, gate, ve) draws')
     p.add_argument('--head-div', type=int, default=1, help='divide the ZO head draws')
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
@@ -75,7 +77,8 @@ def main():
     estimator = None
     if args.method == 'dust':
         estimator = DustX(model, settings, args.seed, head=args.head, local=args.local,
-                          handoff=args.handoff, handoff_draws=args.handoff_draws, oracle=args.oracle)
+                          handoff=args.handoff, handoff_draws=args.handoff_draws, oracle=args.oracle,
+                          credit=args.credit, attn_c=args.attn_c)
     else:
         model.requires_grad_(True)
         if args.method == 'ed':  # noise-free DUST: backprop of the expected DUST update

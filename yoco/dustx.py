@@ -23,8 +23,9 @@ from model import attention, apply_rotary_emb, has_ve, norm
 
 class DustX(DUST):
     def __init__(self, model, settings, seed=42, head='zo', local='zo', handoff=False, handoff_draws=None,
-                 oracle=()):
+                 oracle=(), credit='gamma', attn_c=0.01):
         super().__init__(model, settings, seed)
+        self.credit_mode, self.attn_c = credit, attn_c
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
         self.yoco = hasattr(model, 'n_self')
@@ -119,6 +120,102 @@ class DustX(DUST):
         dX = grads[-1] if want_handoff else None
         return res, dX
 
+    # ---- derivative-free local estimators ------------------------------------------------------
+    def attn_credit(self, qp, kp, window):
+        """Attention-matched credit W[b, h, u, t] = min(1, c * T * P_ut): query u's score goes to row t in
+        proportion to how much u reads t. Uses only forward attention probabilities."""
+        b, t, h, d = qp.shape
+        pos = torch.arange(t, device=qp.device)
+        lag = pos[:, None] - pos[None, :]
+        mask = (lag >= 0) & (lag <= window)
+        P = (qp.float().transpose(1, 2) @ kp.float().transpose(1, 2).transpose(-1, -2) / d ** 0.5)
+        P = P.masked_fill(~mask, float('-inf')).softmax(-1)
+        return (self.attn_c * t * P).clamp(max=1.0)
+
+    def local_errors(self, kind, draws, targets, sigma=0.05):  # DUST.local_errors with a pluggable credit kernel
+        """Score attention-output changes against estimated output errors (no derivatives).
+
+        Each draw recomputes the block's attention output from the cached clean activations and scores the
+        change per head against the output's estimated error (`targets`, computed by direct_errors on the 
+        o@{layer} sites). Queries keep their own token's score; the other kinds sum the scores of later
+        tokens, decayed by gamma per token.
+        """
+        cfg = self.model.config
+        n, b, t, h, d = self.settings.nrep, self.batch, self.length, cfg.n_head, cfg.n_embd // cfg.n_head
+        site_suffix = {'q': 'attn.c_q', 'k': 'attn.c_k', 'v': 'attn.c_v', 'gate': 'attn.ve_gate'}
+        layers = [i for i in range(cfg.n_layer) if kind not in ('ve', 'gate') or has_ve(i, cfg.n_layer)]
+        sites = {
+            i: f'value_embeds.{i}' if kind == 've' else f'transformer.h.{i}.{site_suffix[kind]}'
+            for i in layers
+        }
+        width = h if kind == 'gate' else cfg.n_embd
+        errors = {i: torch.zeros(b, t, width, device=self.device) for i in layers}
+        cos, sin = self.model.cos[:, :t].float(), self.model.sin[:, :t].float()
+
+        def processed(raw):
+            return norm(apply_rotary_emb(raw, cos, sin)).to(self.dtype)
+
+        def repeat(x):
+            return x.unsqueeze(0).expand(n, -1, -1, -1, -1).reshape(n * b, t, h, d)
+
+        clean = {}
+        for i in layers:
+            prefix = f'transformer.h.{i}.attn.'
+            q, k, v = [self.outputs[prefix + 'c_' + name].float().view(b, t, h, d) for name in ('q', 'k', 'v')]
+            z = self.outputs[prefix + 've_gate'].float() if has_ve(i, cfg.n_layer) else None
+            ve = self.outputs[f'value_embeds.{i}'].float().view(b, t, h, d) if z is not None else None
+            values = v if z is None else v + (2 * torch.sigmoid(z)).unsqueeze(-1) * ve
+            qp, kp = processed(q), processed(k)
+            window = self.model.window_sizes[i][0]
+            baseline = attention(qp, kp, values.to(self.dtype), window)
+            positions = torch.arange(t, device=self.device)
+            lag = positions[None, :] - positions[:, None]  # [perturbation position, output position]
+            # credit[t, s]: how much of output s's score goes to the jitter at t, inside the causal window
+            credit = ((lag >= 0) & (lag <= window)).float() * self.settings.gamma ** lag.clamp(min=0)
+            if self.credit_mode == 'attn':
+                credit = self.attn_credit(qp, kp, window)
+            clean[i] = q, k, z, ve, qp, kp, values, baseline, credit
+
+        for _ in range(draws // n):
+            for i in layers:
+                a = self.noise(n, b, t, width, dtype=torch.float32)
+                q, k, z, ve, qp, kp, values, baseline, credit = clean[i]
+                window = self.model.window_sizes[i][0]
+                divisor = sigma
+                if kind in ('q', 'k'):
+                    raw = q if kind == 'q' else k
+                    perturbed = processed(
+                        (raw.unsqueeze(0) + sigma * a.view(n, b, t, h, d)).reshape(n * b, t, h, d)
+                    )
+                    qa, ka = (perturbed, repeat(kp)) if kind == 'q' else (repeat(qp), perturbed)
+                    delta = (
+                        attention(qa, ka, repeat(values.to(self.dtype)), window).view(n, b, t, h, d)
+                        - baseline
+                    )
+                else:
+                    if kind == 'gate':
+                        delta_gate = 2 * torch.sigmoid(z + sigma * a) - 2 * torch.sigmoid(z - sigma * a)
+                        delta_value = delta_gate.unsqueeze(-1) * ve
+                        divisor = 2 * sigma
+                    else:
+                        delta_value = sigma * a.view(n, b, t, h, d)
+                        if kind == 've':
+                            delta_value = delta_value * (2 * torch.sigmoid(z)).unsqueeze(-1)
+                    delta = attention(
+                        repeat(qp), repeat(kp),
+                        delta_value.reshape(n * b, t, h, d).to(self.dtype), window,
+                    ).view(n, b, t, h, d)
+
+                score = torch.einsum('bthd,nbthd->nbth', targets[i].view(b, t, h, d).to(self.dtype), delta)
+                if kind != 'q' and self.credit_mode == 'attn':
+                    score = torch.einsum('nbuh,bhut->nbth', score.float(), credit)
+                elif kind != 'q':
+                    score = torch.einsum('nbsh,ts->nbth', score.float(), credit)
+                estimate = torch.einsum('nbth,nbthd->bthd', score.float(), a.view(n, b, t, h, -1))
+                errors[i] += estimate.reshape(b, t, width) / divisor
+
+        return {sites[i]: errors[i] / draws for i in layers}
+
     # ---- ZO local estimators for the YOCO cross-decoder (stock-DUST analogue) -------------------
     def zo_cross(self, kind, draws, targets, sigma=0.05):
         """kind 'q': each cross layer's queries, own-token score. 'k'/'v': the shared cache, scored against
@@ -136,6 +233,7 @@ class DustX(DUST):
         pos = torch.arange(t, device=self.device)
         lag = pos[None, :] - pos[:, None]
         credit = (lag >= 0).float() * self.settings.gamma ** lag.clamp(min=0)
+        W = {i: self.attn_credit(qp[i], kp, t) for i in cross} if self.credit_mode == 'attn' and kind != 'q' else None
         if kind == 'q':
             errors = {i: torch.zeros(b, t, cfg.n_embd, device=self.device) for i in cross}
         else:
@@ -153,6 +251,7 @@ class DustX(DUST):
                 continue
             a = self.noise(n, b, t, h * d, dtype=torch.float32)
             score = 0
+            credited = 0
             for i in cross:
                 if kind == 'k':
                     ka = self._processed((kr.unsqueeze(0) + sigma * a.view(n, b, t, h, d)).reshape(n * b, t, h, d), t)
@@ -160,9 +259,12 @@ class DustX(DUST):
                 else:
                     delta = attention(rep(qp[i]), rep(kp), (sigma * a).view(n * b, t, h, d).to(self.dtype),
                                       t).view(n, b, t, h, d)
-                score = score + torch.einsum('bthd,nbthd->nbth', targets[i].view(b, t, h, d).to(self.dtype),
-                                             delta).float()
-            score = torch.einsum('nbsh,ts->nbth', score, credit)
+                s_i = torch.einsum('bthd,nbthd->nbth', targets[i].view(b, t, h, d).to(self.dtype), delta).float()
+                if self.credit_mode == 'attn':
+                    credited = credited + torch.einsum('nbuh,bhut->nbth', s_i, W[i])
+                else:
+                    score = score + s_i
+            score = credited if self.credit_mode == 'attn' else torch.einsum('nbsh,ts->nbth', score, credit)
             err += torch.einsum('nbth,nbthd->bthd', score, a.view(n, b, t, h, d)).reshape(b, t, -1) / sigma
         if kind == 'q':
             return {f'transformer.h.{i}.attn.c_q': e / draws for i, e in errors.items()}
