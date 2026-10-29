@@ -15,6 +15,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dust import GPTConfig, make_optimizer, recipe  # noqa: E402
+from yoco import expected  # noqa: E402
 from yoco.dustx import DustX  # noqa: E402
 from yoco.model_yoco import build  # noqa: E402
 
@@ -31,7 +32,7 @@ def evaluate(model, rows, batch_size=32):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--arch', choices=['gpt', 'yoco'], default='gpt')
-    p.add_argument('--method', choices=['dust', 'bp'], default='dust')
+    p.add_argument('--method', choices=['dust', 'bp', 'ed'], default='dust')
     p.add_argument('--head', choices=['zo', 'exact'], default='zo')
     p.add_argument('--local', choices=['zo', 'vjp'], default='zo')
     p.add_argument('--handoff', action='store_true')
@@ -69,6 +70,8 @@ def main():
                           handoff=args.handoff, handoff_draws=args.handoff_draws)
     else:
         model.requires_grad_(True)
+        if args.method == 'ed':  # noise-free DUST: backprop of the expected DUST update
+            expected.install(model, settings.gamma, cross_full=args.handoff)
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'config.json').write_text(json.dumps(dict(
         args={k: str(v) for k, v in vars(args).items()}, model=asdict(config), recipe=asdict(settings),
