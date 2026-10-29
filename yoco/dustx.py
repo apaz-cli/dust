@@ -22,8 +22,10 @@ from model import attention, apply_rotary_emb, has_ve, norm
 
 
 class DustX(DUST):
-    def __init__(self, model, settings, seed=42, head='zo', local='zo', handoff=False, handoff_draws=None):
+    def __init__(self, model, settings, seed=42, head='zo', local='zo', handoff=False, handoff_draws=None,
+                 oracle=()):
         super().__init__(model, settings, seed)
+        self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
         self.yoco = hasattr(model, 'n_self')
         self.n_self = model.n_self if self.yoco else model.config.n_layer
@@ -178,6 +180,41 @@ class DustX(DUST):
         finally:
             cfg.n_layer = saved
 
+    # ---- noise-free expected update for selected groups --------------------------------------
+    @staticmethod
+    def group(name):
+        if name == 'lm_head.weight':
+            return 'head'
+        if name == 'transformer.wte.weight':
+            return 'wte'
+        if 'c_proj' in name:
+            return 'writers'
+        if 'c_fc' in name:
+            return 'hidden'
+        if 'lambdas' in name:
+            return 'scalars'
+        return 'attn'
+
+    def expected_grads(self, x, y):
+        from yoco import expected
+        m = self.model
+        expected.install(m, self.settings.gamma, cross_full=self.handoff)
+        params = {n: p for n, p in m.named_parameters() if self.group(n) in self.oracle}
+        try:
+            with torch.enable_grad(), self.autocast():
+                for p in params.values():
+                    p.requires_grad_(True)
+                loss = m(x, y, loss_reduction='sum')
+                gs = torch.autograd.grad(loss, list(params.values()))
+        finally:
+            for p in params.values():
+                p.requires_grad_(False)
+            for blk in m.transformer.h:
+                del blk.attn.forward
+            if self.yoco:
+                del m.cache
+        return {n: g.float() for n, g in zip(params, gs)}
+
     # ---- the update ----------------------------------------------------------------------------
     @torch.no_grad()
     def step(self, x, y, optimizer):
@@ -249,6 +286,8 @@ class DustX(DUST):
         for site, error in errors.items():
             grads[site + '.weight'] = self.reassemble(site, error)
         grads.update(self.scalar_gradients(8))
+        if self.oracle:
+            grads.update(self.expected_grads(x, y))
 
         valid = (y != -1).sum()
         optimizer.zero_grad(set_to_none=True)

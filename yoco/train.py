@@ -38,6 +38,7 @@ def main():
     p.add_argument('--handoff', action='store_true')
     p.add_argument('--handoff-draws', type=int)
     p.add_argument('--gamma', type=float)
+    p.add_argument('--oracle', nargs='*', default=[], help='groups given their noise-free expected update')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
     p.add_argument('--steps', type=int, default=3000)
@@ -67,7 +68,7 @@ def main():
     estimator = None
     if args.method == 'dust':
         estimator = DustX(model, settings, args.seed, head=args.head, local=args.local,
-                          handoff=args.handoff, handoff_draws=args.handoff_draws)
+                          handoff=args.handoff, handoff_draws=args.handoff_draws, oracle=args.oracle)
     else:
         model.requires_grad_(True)
         if args.method == 'ed':  # noise-free DUST: backprop of the expected DUST update
