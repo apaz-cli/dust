@@ -73,3 +73,20 @@
   Every local design then has per-step cos ~0 (momentum averages across steps); per-step bench can't rank them.
 - YOCO direct cache scoring (jitter cache rows, reward with attention-weighted later losses, no o@ stage):
   rel 13-52 (attn) / 44-455 (gamma) vs 5-7 via hub route -> rejected; each token loss carries every read row's jitter.
+
+## bf16 rounding noise in DUST rewards (yoco/bench_hub_precision.py, q1/yoco-dust, 96 o@ draws, cos to exact o@ error)
+- bf16 stock sigma: o@0 .379 o@1 .198 o@2 .154 o@3 .091 | sigma x2: .390 .291 .238 .151 | x4: .391 .357 .323 .235
+- fp32 (and TF32 matmuls): .395 .397 .395 .397 at every sigma -> the draw-noise floor.
+- => bf16 rounding of loss differences inflates deep-hub variance up to ~19x (cos^2 .008 vs .158). TF32 costs ~1.4x per draw.
+- Writers / MLP (yoco/bench_site_precision.py, 64 draws, sigma 0.2, cos to exact own-token error):
+  YOCO bf16: b0 .262/.171/.230  b1 .104/.145/.105  b2 .048/.095/.047  b3 .030/.082/.028 (attn.c_proj/mlp.c_fc/mlp.c_proj)
+  YOCO fp32: every block .30-.33 / .173 / .30-.33  (the d/Z floor; c_fc is 4x wider)
+  GPT  bf16: b2 .063/.122/.065  b3 .036/.089/.035 ; fp32 .31-.33 / .17 / .31-.33
+  => bf16 rounding inflates deep-writer variance 50-100x. General DUST finding, not YOCO-specific.
+     The repo's draw allocation (38,32,16,10 for L4) puts few draws where bf16 estimates are near-useless.
+
+## Training, derivative-free arms (L4, seed 42)
+- gpt-local4 (4x ZO local draws): 3.011 vs gpt-dust 3.115 (-0.10), context gain 0.386.
+- yoco-attn (attention-matched credit, c=.01): 3.170 vs yoco-dust 3.128 (+0.04 worse), gain 0.217.
+  Per-step alignment improved on the bench, but credit proportional to current attention cannot teach a query
+  to attend somewhere new (rich-get-richer bias). Dropped.
