@@ -138,3 +138,16 @@
 - L8-D512 best (fp32+local4+hub4+emb4): 2.904 vs stock 3.163 (-0.259), 7305 s vs 3846 s (1.9x), context gain .358.
 - Queue 5: emb16 2.744 (vs emb4 2.777, 2644 s) | fp32-local4-hub4-flat 2.952 (vs 2.842: stock front-loaded allocation is better)
   | yoco-hub4 bf16 alone 3.016 (vs stock 3.131).
+
+# Night 2 (2026-10-30)
+## Perf (L4 YOCO): fixed CE (2610.31642) + compiled head loss + flash causal + fast16 (fp16 matmuls/attention, fp32 stream,
+## fp32-output lm_head) + truncated draws (bit-exact) + batched head draws.
+- draw cost: 2.12 ms (TF32, morning) -> 0.97 fast16 -> 0.55 truncated (avg over sites). fast16 quality = TF32 (deep c_proj cos .297 vs .298).
+- step: stock bf16 0.37 s; old best (TF32, untruncated) 0.605 s; best fast16+trunc 0.455 s -> after head batching ~0.39 s.
+- nrep (draws per forward) 2..16: no speedup (GPU saturated at 8192 tokens).
+- NVFP4 _scaled_mm works on 5090: 82 us vs fp16 421 us (5x), fp8 1.9x (16384x512x2048).
+## KV-credit augmentation (reward += <e_strict K/V, delta K/V> for upstream draws), bp-trained YOCO, 24 reps:
+- ZO K/V errors (hub4/local4): step err block0 c_proj 2.21 -> 10.85, c_fc 7.9 -> 42, wte 2.4 -> 218 (fails: K/V error noise).
+- exact K/V errors (autograd ruler): cos to TRUE 0.752 -> 0.837 (b0 c_proj), .560 -> .620 (c_fc), wte .558 -> .778, step err ~same.
+  => correct bias fix; bottleneck is K/V error quality (per-step cos ~.01-.05).
+## Allocation probe (alloc_probe.py), best-fast step 500: B_g ~ 300-3000 per group (N << B everywhere: linear regime).

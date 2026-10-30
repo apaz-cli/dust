@@ -16,3 +16,5 @@ run stock-fast      --arch yoco --method dust --precision fast16
 run stock-wsd2      --arch yoco --method dust --wsd 0.2
 run quant-master    --arch yoco --method dust $BEST --quant master
 run quant-sr        --arch yoco --method dust $BEST --quant sr
+run best-linv       --arch yoco --method dust $BEST --linear-v
+run best-linv-kvc   --arch yoco --method dust $BEST --linear-v --kv-credit

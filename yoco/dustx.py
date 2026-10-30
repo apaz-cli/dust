@@ -30,6 +30,12 @@ class DustX(DUST):
         self.precision = 'bf16'
         self.truncate = True
         self._start = 0
+        self.linear_v = False        # value errors from the linear attention map (forward probabilities), no draws
+        self.kv_credit = False
+        self.kv_credit_values_only = False
+        self.kv_credit_embedding = False       # augment upstream rewards with cross-token credit through estimated K/V errors
+        self.kv_strict = {}          # module name -> error at its output, credited from strictly later queries
+        self._aug, self._draw_outs = {}, {}
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
@@ -73,6 +79,38 @@ class DustX(DUST):
                 self.clean_loss = self.model(x, y, loss_reduction='none', record=self.state).view_as(y).float()
         finally:
             self.capturing = False
+
+    def output_hook(self, name):
+        base = DUST.output_hook(self, name)
+
+        def hook(module, args, output):
+            out = base(module, args, output)
+            if name in self._aug and not self.capturing:
+                self._draw_outs[name] = output
+            return out
+        return hook
+
+    def aug_names(self, layer):
+        """Strict K/V errors that a jitter in block `layer` (-1: the embedding) can reach at its own row."""
+        out = {}
+        for name, e in self.kv_strict.items():
+            if self.kv_credit_values_only and not (name.endswith('c_v') or name.endswith('cache_v')):
+                continue
+            if name.startswith('transformer.cache_'):
+                if self.yoco and layer < self.n_self:
+                    out[name] = e
+            elif int(name.split('.')[2]) > layer:
+                out[name] = e
+        return out
+
+    def aug_loss(self, n):
+        """Predicted loss change through later K/V rows: sum over modules of <e_strict, out - clean_out>."""
+        b, t = self.batch, self.length
+        tot = 0
+        for name, e in self._aug.items():
+            d = self._draw_outs[name].float().view(n, b, t, -1) - self.outputs[name].float().view(1, b, t, -1)
+            tot = tot + torch.einsum('btw,nbtw->nbt', e, d)
+        return tot
 
     def start_for(self, sites):
         """First block a jitter at these sites can change; draws rerun the model from there."""
@@ -134,6 +172,8 @@ class DustX(DUST):
             self.jitter = {s: sigma * a for s, a in noise.items()}
             try:
                 perturbed_loss = self.losses(x, y).view(n, self.batch, self.length)
+                if self._aug:
+                    perturbed_loss = perturbed_loss + self.aug_loss(n)
             finally:
                 self.jitter = {}
 
@@ -302,6 +342,8 @@ class DustX(DUST):
         }
         width = h if kind == 'gate' else cfg.n_embd
         errors = {i: torch.zeros(b, t, width, device=self.device) for i in layers}
+        strict = {}
+        self._strict_credit = {}
         cos, sin = self.model.cos[:, :t].float(), self.model.sin[:, :t].float()
 
         def processed(raw):
@@ -324,11 +366,32 @@ class DustX(DUST):
             lag = positions[None, :] - positions[:, None]  # [perturbation position, output position]
             # credit[t, s]: how much of output s's score goes to the jitter at t, inside the causal window
             credit = ((lag >= 0) & (lag <= window)).float() * self.settings.gamma ** lag.clamp(min=0)
+            self._strict_credit[i] = credit * (lag >= 1).float()
             if self.credit_mode == 'attn':
                 credit = self.attn_credit(qp, kp, window)
             clean[i] = q, k, z, ve, qp, kp, values, baseline, credit
 
-        for _ in range(draws // n):
+        if self.linear_v and kind in ('v', 've'):
+            # Values enter attention linearly: e_v[s] = sum_u credit(s, u) p[u, s] e_o[u], from forward quantities.
+            for i in layers:
+                q, k, z, ve, qp, kp, values, baseline, credit = clean[i]
+                window = self.model.window_sizes[i][0]
+                pos = torch.arange(t, device=self.device)
+                lagus = pos[:, None] - pos[None, :]  # [u, s]
+                mask = (lagus >= 0) & (lagus <= window)
+                P = (qp.float().transpose(1, 2) @ kp.float().transpose(1, 2).transpose(-1, -2) / d ** 0.5)
+                P = P.masked_fill(~mask, float('-inf')).softmax(-1)                      # [b, h, u, s]
+                G = torch.where(mask, self.settings.gamma ** lagus.clamp(min=0).float(), torch.zeros((), device=self.device))
+                eo = targets[i].float().view(b, t, h, d).transpose(1, 2)                  # [b, h, u, d]
+                ev = ((P * G).transpose(-1, -2) @ eo).transpose(1, 2)                     # [b, s, h, d]
+                if self.kv_credit and kind == 'v':
+                    evs = ((P * G * (lagus >= 1).float()).transpose(-1, -2) @ eo).transpose(1, 2)
+                    self.kv_strict[sites[i]] = evs.reshape(b, t, -1)
+                if kind == 've':
+                    ev = ev * (2 * torch.sigmoid(z.float())).unsqueeze(-1)
+                errors[i] = ev.reshape(b, t, -1) * draws
+            draws_eff = draws
+        for _ in range(0 if (self.linear_v and kind in ('v', 've')) else draws // n):
             for i in layers:
                 a = self.noise(n, b, t, width, dtype=torch.float32)
                 q, k, z, ve, qp, kp, values, baseline, credit = clean[i]
@@ -359,6 +422,11 @@ class DustX(DUST):
                     ).view(n, b, t, h, d)
 
                 score = torch.einsum('bthd,nbthd->nbth', targets[i].view(b, t, h, d).to(self.dtype), delta)
+                if self.kv_credit and kind in ('k', 'v', 'gate'):
+                    # credit from strictly later queries only: the extra reward for upstream draws
+                    sc = torch.einsum('nbsh,ts->nbth', score.float(), self._strict_credit[i])
+                    est_s = torch.einsum('nbth,nbthd->bthd', sc, a.view(n, b, t, h, -1))
+                    strict[i] = strict.get(i, 0) + est_s.reshape(b, t, width) / divisor
                 if kind != 'q' and self.credit_mode == 'attn':
                     score = torch.einsum('nbuh,bhut->nbth', score.float(), credit)
                 elif kind != 'q':
@@ -366,6 +434,8 @@ class DustX(DUST):
                 estimate = torch.einsum('nbth,nbthd->bthd', score.float(), a.view(n, b, t, h, -1))
                 errors[i] += estimate.reshape(b, t, width) / divisor
 
+        for i, e in strict.items():
+            self.kv_strict[sites[i]] = e / draws
         return {sites[i]: errors[i] / draws for i in layers}
 
     # ---- ZO local estimators for the YOCO cross-decoder (stock-DUST analogue) -------------------
@@ -386,10 +456,23 @@ class DustX(DUST):
         lag = pos[None, :] - pos[:, None]
         credit = (lag >= 0).float() * self.settings.gamma ** lag.clamp(min=0)
         W = {i: self.attn_credit(qp[i], kp, t) for i in cross} if self.credit_mode == 'attn' and kind != 'q' else None
+        if kind == 'v' and self.linear_v:
+            G = (lag.T >= 0).float() * self.settings.gamma ** lag.T.clamp(min=0).float()   # [u, s]
+            ev, evs = 0, 0
+            for i in cross:
+                P = (qp[i].float().transpose(1, 2) @ kp.float().transpose(1, 2).transpose(-1, -2) / d ** 0.5)
+                P = P.masked_fill(G == 0, float('-inf')).softmax(-1)
+                eo = targets[i].float().view(b, t, h, d).transpose(1, 2)
+                ev = ev + ((P * G).transpose(-1, -2) @ eo).transpose(1, 2)
+                evs = evs + ((P * G * (lag.T >= 1).float()).transpose(-1, -2) @ eo).transpose(1, 2)
+            if self.kv_credit:
+                self.kv_strict['transformer.cache_v'] = evs.reshape(b, t, -1)
+            return {'transformer.cache_v': ev.reshape(b, t, -1)}
         if kind == 'q':
             errors = {i: torch.zeros(b, t, cfg.n_embd, device=self.device) for i in cross}
         else:
             err = torch.zeros(b, t, cfg.n_embd, device=self.device)
+            err_strict = 0
         for _ in range(draws // n):
             if kind == 'q':
                 for i in cross:
@@ -416,10 +499,15 @@ class DustX(DUST):
                     credited = credited + torch.einsum('nbuh,bhut->nbth', s_i, W[i])
                 else:
                     score = score + s_i
+            if self.kv_credit and self.credit_mode != 'attn':
+                sc = torch.einsum('nbsh,ts->nbth', score, credit * (lag >= 1).float())
+                err_strict = err_strict + torch.einsum('nbth,nbthd->bthd', sc, a.view(n, b, t, h, d)).reshape(b, t, -1) / sigma
             score = credited if self.credit_mode == 'attn' else torch.einsum('nbsh,ts->nbth', score, credit)
             err += torch.einsum('nbth,nbthd->bthd', score, a.view(n, b, t, h, d)).reshape(b, t, -1) / sigma
         if kind == 'q':
             return {f'transformer.h.{i}.attn.c_q': e / draws for i, e in errors.items()}
+        if self.kv_credit:
+            self.kv_strict[f'transformer.cache_{kind}'] = err_strict / draws
         return {f'transformer.cache_{kind}': err / draws}
 
     def zo_self_local(self, kind, draws, targets):
@@ -486,6 +574,25 @@ class DustX(DUST):
             sigma = 0.2 if layer < L // 2 else 0.4
             return self.direct_errors([f'o@{layer}'], r.hubs[layer], sigma)[f'o@{layer}']
 
+        if self.kv_credit and not self.handoff:
+            # Hubs and attention internals first: their strictly-later K/V errors augment every upstream reward.
+            self.kv_strict = {}
+            targets = {layer: hub(layer) for layer in range(L)}
+            if self.yoco:
+                for kind in ('q', 'k', 'v'):
+                    errors.update(self.zo_cross(kind, r.local[kind], targets))
+            for kind, count in r.local.items():
+                errors.update(self.zo_self_local(kind, count, targets))
+            for layer in range(L):
+                p = f'transformer.h.{layer}.'
+                self._aug = self.aug_names(layer)
+                direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[layer], 0.2)
+                direct([p + 'mlp.c_fc'], r.hidden[layer], 0.2)
+            self._aug = self.aug_names(-1) if self.kv_credit_embedding else {}
+            direct(['transformer.wte'], r.embedding, 0.2)
+            self._aug, self._draw_outs = {}, {}
+            return self.finish(x, y, optimizer, errors)
+
         # Cross-decoder (YOCO) or the whole model (GPT): token-loss rewards.
         first = S if (self.yoco and self.handoff) else 0
         for layer in range(first, L):
@@ -532,6 +639,11 @@ class DustX(DUST):
             for kind, count in r.local.items():
                 errors.update(self.zo_self_local(kind, count, targets))
 
+        return self.finish(x, y, optimizer, errors)
+
+    def finish(self, x, y, optimizer, errors):
+        r = self.settings
+        grads = {}
         if self.head_mode == 'exact':
             errors['lm_head'] = self.exact_head_error()
         else:

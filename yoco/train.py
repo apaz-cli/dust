@@ -51,6 +51,8 @@ def main():
                                    '"embedding": n, "head": n}; applied after every scale flag')
     p.add_argument('--quant', choices=['none', 'master', 'sr'], default='none',
                    help='NVFP4 block weights: master = fp32 master + quantized forwards; sr = stored in NVFP4, SR updates')
+    p.add_argument('--linear-v', action='store_true', help='value errors from the linear attention map (no V draws)')
+    p.add_argument('--kv-credit', action='store_true', help='cross-token credit through estimated K/V errors')
     p.add_argument('--wsd', type=float, default=0.0, help='WSD: decay the lr linearly to 0 over this final fraction')
     p.add_argument('--no-truncate', action='store_true', help='rerun the whole model for every draw')
     p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
@@ -110,6 +112,9 @@ def main():
                           res_gamma=args.res_gamma, res_blocks=args.res_blocks)
         estimator.set_precision('tf32' if args.fp32 else args.precision)
         estimator.truncate = not args.no_truncate
+        estimator.kv_credit = args.kv_credit
+        estimator.linear_v = args.linear_v
+        estimator.kv_credit_values_only = args.linear_v  # with linear values, only the value path is clean enough
     else:
         model.requires_grad_(True)
         if args.method == 'ed':  # noise-free DUST: backprop of the expected DUST update

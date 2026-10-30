@@ -102,7 +102,7 @@ class Reader:
         kp = self.proc(k_raw)
         return {i: attention(self.q[i].repeat(rep, 1, 1, 1), kp, v, self.win[i]) for i in self.layers}
 
-    def expected(self, e, gamma):
+    def expected(self, e, gamma, strict=False):
         """Autograd measurement: E_t = sum_u gamma^(u-t) (d o_u/d x_t)^T e_u for the jittered tensor x.
         Uses the verified weight route of yoco/expected.py with the probabilities held fixed."""
         t, sc = self.t, 1 / self.d ** 0.5
@@ -118,6 +118,8 @@ class Reader:
                 mask = (lag >= 0) & (lag <= self.win[i])
                 P = (q @ kw.detach().transpose(-1, -2) * sc).masked_fill(~mask, float('-inf')).softmax(-1)
                 G = torch.where(mask, gamma ** lag.clamp(min=0).float(), torch.zeros((), device='cuda'))
+                if strict:
+                    G = G * (lag >= 1).float()
                 vd = vw.detach()
                 od = P @ vd
                 M = P * G
