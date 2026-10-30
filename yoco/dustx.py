@@ -32,6 +32,9 @@ class DustX(DUST):
         self._start = 0
         self.linear_v = False        # value errors from the linear attention map (forward probabilities), no draws
         self.kv_credit = False
+        self.pool = False            # residual pooling of writer estimates across depths
+        self.pool_decay = 0.9
+        self._halves, self._pool_ema = {}, {}
         self.delta_fmt = None        # 'fp8' / 'nvfp4': emulate low-precision delta forwards in every draw
         self._qw = {}
         self.kv_credit_values_only = False
@@ -182,6 +185,7 @@ class DustX(DUST):
         x, y = self.x.repeat(n, 1), self.y.repeat(n, 1)
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
         errors = {s: torch.zeros(self.batch, self.length, width(s), device=self.device) for s in sites}
+        halves, chunk = {}, 0
 
         for _ in range(draws // n):
             noise = {s: self.noise(n * self.batch, self.length, width(s)) for s in sites}
@@ -204,12 +208,19 @@ class DustX(DUST):
                 K = (lag >= 0).float() * self.res_gamma ** lag.clamp(min=0).float()
                 reward = torch.einsum('nbu,tu->nbt', reward, K)
             for site, a in noise.items():
-                errors[site] -= torch.einsum(
+                contrib = torch.einsum(
                     'nbt,nbtd->btd', reward.to(self.dtype),
                     a.view(n, self.batch, self.length, -1),
                 ).float() / sigma
+                errors[site] -= contrib
+                if self.pool:  # half-sums for unbiased signal and noise moments
+                    halves.setdefault(site, [0, 0])[chunk % 2] = halves.get(site, [0, 0])[chunk % 2] - contrib
+            chunk += 1
 
         self._start = 0
+        if self.pool:
+            for site, (h0, h1) in halves.items():
+                self._halves[site] = (h0 * 2 / draws, h1 * 2 / draws)
         return {s: error / draws for s, error in errors.items()}
 
     # ---- head ----
@@ -573,6 +584,53 @@ class DustX(DUST):
                 del m.cache
         return {n: g.float() for n, g in zip(params, gs)}
 
+    # ---- residual pooling --------------------------------------------------------------------------
+    def pool_writers(self, errors):
+        """Combine every writer site's error estimate into each site's estimate.
+
+        Residual-stream errors at different depths are nearly parallel, so the other sites' draws are extra
+        draws for this one. With unbiased moments from independent draws (cross-site products, split-half
+        products, both averaged over steps) each site s gets
+            pooled_s = sum_j w_j k_sj est_j / sum_j w_j,  k_sj = <g_s, g_j> / |g_j|^2,
+            w_j = 1 / (k_sj^2 noise_j + (1 - cos_sj^2) |g_s|^2)     (noise plus the bias of using site j)
+        """
+        sites = [s for s in self._halves if s in errors and (s.endswith('c_proj') or s == 'transformer.wte')]
+        if len(sites) < 2:
+            return errors
+        S = len(sites)
+        C = torch.zeros(S, S, dtype=torch.float64)
+        noise = torch.zeros(S, dtype=torch.float64)
+        for i, a in enumerate(sites):
+            h0, h1 = self._halves[a]
+            C[i, i] = (h0 * h1).sum().item()
+            noise[i] = ((h0 - h1).square().sum().item()) / 4.0
+            for j in range(i + 1, S):
+                C[i, j] = C[j, i] = (errors[a] * errors[sites[j]]).sum().item()
+        key = tuple(sites)
+        if self._pool_ema.get(key) is None:
+            self._pool_ema[key] = (C, noise)
+        else:
+            C0, n0 = self._pool_ema[key]
+            self._pool_ema[key] = (self.pool_decay * C0 + (1 - self.pool_decay) * C,
+                                   self.pool_decay * n0 + (1 - self.pool_decay) * noise)
+        C, noise = self._pool_ema[key]
+        diag = C.diag().clamp_min(1e-30)
+        out = dict(errors)
+        for i, a in enumerate(sites):
+            if C[i, i] <= 0:
+                continue
+            num, den = 0, 0.0
+            for j, bname in enumerate(sites):
+                if j != i and (C[j, j] <= 0 or C[i, j] <= 0):
+                    continue
+                k = (C[i, j] / diag[j]).item() if j != i else 1.0
+                cos2 = (C[i, j] ** 2 / (diag[i] * diag[j])).clamp(max=1.0).item() if j != i else 1.0
+                w = 1.0 / (k * k * noise[j].item() + (1 - cos2) * diag[i].item() + 1e-30)
+                num = num + w * k * errors[bname]
+                den += w
+            out[a] = num / den
+        return out
+
     # ---- the update ----------------------------------------------------------------------------
     @torch.no_grad()
     def step(self, x, y, optimizer):
@@ -660,6 +718,9 @@ class DustX(DUST):
     def finish(self, x, y, optimizer, errors):
         r = self.settings
         grads = {}
+        if self.pool:
+            errors = self.pool_writers(errors)
+            self._halves = {}
         if self.head_mode == 'exact':
             errors['lm_head'] = self.exact_head_error()
         else:

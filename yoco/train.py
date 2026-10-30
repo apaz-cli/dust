@@ -52,6 +52,7 @@ def main():
     p.add_argument('--quant', choices=['none', 'master', 'sr'], default='none',
                    help='NVFP4 block weights: master = fp32 master + quantized forwards; sr = stored in NVFP4, SR updates')
     p.add_argument('--linear-v', action='store_true', help='value errors from the linear attention map (no V draws)')
+    p.add_argument('--pool', action='store_true', help='residual pooling of writer and embedding estimates')
     p.add_argument('--kv-credit', action='store_true', help='cross-token credit through estimated K/V errors')
     p.add_argument('--draw-ramp', action='store_true',
                    help='same total draws, spent late: 0.75x for the first 60%% of steps, then linear 0.75x -> 2x')
@@ -116,6 +117,7 @@ def main():
         estimator.set_precision('tf32' if args.fp32 else args.precision)
         estimator.truncate = not args.no_truncate
         estimator.kv_credit = args.kv_credit
+        estimator.pool = args.pool
         estimator.linear_v = args.linear_v
         estimator.kv_credit_values_only = args.linear_v  # with linear values, only the value path is clean enough
     else:
