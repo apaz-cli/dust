@@ -11,6 +11,8 @@ BEST="--precision fast16 --local-scale 4 --hub-scale 4 --emb-scale 4"
 run best-fast       --arch yoco --method dust $BEST
 run best-fast-wsd2  --arch yoco --method dust $BEST --wsd 0.2
 run best-pool       --arch yoco --method dust $BEST --pool
+run chain-a         --arch yoco --method dust --precision fast16 --chain 256 --local-scale 4 --emb-scale 4
+run chain-b         --arch yoco --method dust --precision fast16 --chain 256 --local-scale 4 --emb-scale 4 --direct-scale 2
 run stock-fast-pool --arch yoco --method dust --precision fast16 --pool
 run stock-fast      --arch yoco --method dust --precision fast16
 run best-pool-wsd2  --arch yoco --method dust $BEST --pool --wsd 0.2

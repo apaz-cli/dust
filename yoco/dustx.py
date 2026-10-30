@@ -32,7 +32,9 @@ class DustX(DUST):
         self._start = 0
         self.linear_v = False        # value errors from the linear attention map (forward probabilities), no draws
         self.kv_credit = False
-        self.pool = False            # residual pooling of writer estimates across depths
+        self.pool = False
+        self.chain = False           # local chaining (implies pooling): no hidden or hub full-forward draws
+        self.chain_draws = 256            # residual pooling of writer estimates across depths
         self.pool_decay = 0.9
         self._halves, self._pool_ema = {}, {}
         self.delta_fmt = None        # 'fp8' / 'nvfp4': emulate low-precision delta forwards in every draw
@@ -584,6 +586,35 @@ class DustX(DUST):
                 del m.cache
         return {n: g.float() for n, g in zip(params, gs)}
 
+    # ---- local chaining: cheap local probes scored against pooled stream errors ------------------------
+    def local_mlp(self, layer, target, draws, sigma=0.2, n=16):
+        """Error at mlp.c_fc's output: jitter it, rerun only relu^2 and mlp.c_proj, score the change in the MLP
+        output against `target` (the error at mlp.c_proj's output). Antithetic pairs; forward only."""
+        p = f'transformer.h.{layer}.mlp.'
+        h = self.outputs[p + 'c_fc'].float()
+        W2 = self.modules[p + 'c_proj'].weight.float()
+        b, t, f = h.shape
+        base = torch.relu(h).square()
+        est = torch.zeros_like(h)
+        for _ in range(draws // n):
+            a = torch.randn(n, b, t, f, device=self.device, generator=self.generator)
+            dp = (torch.relu(h + sigma * a).square() - base) @ W2.t()
+            dm = (torch.relu(h - sigma * a).square() - base) @ W2.t()
+            score = torch.einsum('btd,nbtd->nbt', target, (dp - dm) / 2)
+            est += torch.einsum('nbt,nbtf->btf', score, a) / sigma
+        return est / draws
+
+    def local_proj(self, layer, target, draws, sigma=0.2, n=16):
+        """Error at the attention output (o@): jitter it, rerun only attn.c_proj, score against `target`."""
+        W = self.modules[f'transformer.h.{layer}.attn.c_proj'].weight.float()
+        b, t, d = target.shape
+        est = torch.zeros(b, t, W.shape[1], device=self.device)
+        for _ in range(draws // n):
+            a = torch.randn(n, b, t, W.shape[1], device=self.device, generator=self.generator)
+            score = torch.einsum('btd,nbtd->nbt', target, (sigma * a) @ W.t())
+            est += torch.einsum('nbt,nbtf->btf', score, a) / sigma
+        return est / draws
+
     # ---- residual pooling --------------------------------------------------------------------------
     def pool_writers(self, errors):
         """Combine every writer site's error estimate into each site's estimate.
@@ -665,6 +696,27 @@ class DustX(DUST):
             self._aug = self.aug_names(-1) if self.kv_credit_embedding else {}
             direct(['transformer.wte'], r.embedding, 0.2)
             self._aug, self._draw_outs = {}, {}
+            return self.finish(x, y, optimizer, errors)
+
+        if self.chain and not self.handoff and not self.kv_credit:
+            # Full forwards only at residual-stream sites (writers, embedding), pooled across depths; MLP-hidden
+            # and attention-output errors come from cheap local probes scored against the pooled stream errors.
+            for layer in range(L):
+                p = f'transformer.h.{layer}.'
+                direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[layer], 0.2)
+            direct(['transformer.wte'], r.embedding, 0.2)
+            errors = self.pool_writers(errors)
+            self._halves = {}
+            targets = {}
+            for layer in range(L):
+                p = f'transformer.h.{layer}.'
+                errors[p + 'mlp.c_fc'] = self.local_mlp(layer, errors[p + 'mlp.c_proj'], self.chain_draws)
+                targets[layer] = self.local_proj(layer, errors[p + 'attn.c_proj'], self.chain_draws)
+            if self.yoco:
+                for kind in ('q', 'k', 'v'):
+                    errors.update(self.zo_cross(kind, r.local[kind], targets))
+            for kind, count in r.local.items():
+                errors.update(self.zo_self_local(kind, count, targets))
             return self.finish(x, y, optimizer, errors)
 
         # Cross-decoder (YOCO) or the whole model (GPT): token-loss rewards.
