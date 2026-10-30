@@ -12,6 +12,9 @@ def attention(q, k, v, window):
     A query at position s sees keys at s - window to s.
     """
     length = q.shape[1]
+    if window >= length - 1:  # plain causal: lets SDPA pick the flash kernel
+        out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        return out.transpose(1, 2)
     positions = torch.arange(length, device=q.device)
     distance = positions[:, None] - positions[None, :]
     mask = (distance >= 0) & (distance <= window)
@@ -31,6 +34,41 @@ class GPTConfig:
     n_embd: int = 512
     # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
+
+
+def cross_entropy(logits, targets, ignore_index=-1, reduction='mean'):
+    """Hard-target cross-entropy computed from logit differences (Barron et al., "A Fix for Softmax and
+    Cross-Entropy", arXiv:2610.31642). The target logit is an exact 0 after shifting, so confident tokens keep
+    their small losses and gradients instead of rounding to zero. logits [N, V] float, targets [N]."""
+    t = targets.clamp(min=0)
+    z_t = logits.gather(-1, t[:, None])
+    is_t = torch.zeros_like(logits, dtype=torch.bool).scatter_(-1, t[:, None], True)
+    shifted = torch.where(is_t, 0.0, logits - z_t)
+    b = shifted.max(-1, keepdim=True).values  # >= 0: the target slot is 0
+    s = torch.where(is_t, 0.0, torch.exp(shifted - b)).sum(-1)
+    b = b[:, 0]
+    loss = b + torch.log1p(s + torch.expm1(-b))
+    valid = targets != ignore_index
+    loss = torch.where(valid, loss, 0.0)
+    if reduction == 'none':
+        return loss
+    if reduction == 'sum':
+        return loss.sum()
+    return loss.sum() / valid.sum()
+
+
+def _capped_ce(raw, targets, vocab, reduction):
+    logits = raw[..., :vocab].float()
+    logits = 15 * torch.tanh(logits / 15)
+    return cross_entropy(logits.reshape(-1, vocab), targets.reshape(-1), reduction=reduction)
+
+
+_capped_ce_compiled = torch.compile(_capped_ce, dynamic=False)
+
+
+def head_loss(raw, targets, vocab, reduction='mean'):
+    """Soft-capped cross-entropy of the raw lm_head output, fused by torch.compile."""
+    return _capped_ce_compiled(raw, targets, vocab, reduction)
 
 
 def norm(x):
@@ -181,21 +219,28 @@ class GPT(nn.Module):
         sizes[-1] = (long_w, 0)
         return sizes
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', start=0, state=None, record=None):
+        """start/state: resume at block `start` from a recorded clean pass (state['x'][i] is the stream entering
+        block i, state['x0'] the normalized embedding). record: dict filled with those tensors."""
         B, T = idx.size()
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
-        x = norm(self.transformer.wte(idx))
-        x0 = x
+        if start:
+            x, x0 = state['x'][start], state['x0']
+        else:
+            x = norm(self.transformer.wte(idx))
+            x0 = x
+        if record is not None:
+            record['x0'], record['x'] = x0, {}
         for i, block in enumerate(self.transformer.h):
+            if i < start:
+                continue
+            if record is not None:
+                record['x'][i] = x
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
-        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)  # soft cap, repeated in DUST.head_error
-        if targets is not None:
-            return F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1),
-                ignore_index=-1, reduction=loss_reduction,
-            )
-        return logits
+        raw = self.lm_head(x)
+        if targets is not None:  # soft cap 15, repeated in DUST.head_error
+            return head_loss(raw, targets, self.config.vocab_size, loss_reduction)
+        return 15 * torch.tanh(raw[..., :self.config.vocab_size].float() / 15)

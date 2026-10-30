@@ -44,7 +44,11 @@ def main():
     p.add_argument('--emb-scale', type=int, default=1, help='multiply the token-embedding draws')
     p.add_argument('--direct-scale', type=int, default=1, help='multiply writer and hidden draws')
     p.add_argument('--flat-alloc', action='store_true', help='same writer/hidden draws in every block (same total)')
-    p.add_argument('--fp32', action='store_true', help='DUST forwards in fp32 activations (TF32 matmuls), not bf16')
+    p.add_argument('--fp32', action='store_true', help='same as --precision tf32')
+    p.add_argument('--precision', choices=['bf16', 'tf32', 'fast16'], default='bf16',
+                   help='DUST forwards: bf16 (stock), tf32 (fp32 activations) or fast16 (fp16 matmuls, fp32 stream and logits)')
+    p.add_argument('--wsd', type=float, default=0.0, help='WSD: decay the lr linearly to 0 over this final fraction')
+    p.add_argument('--no-truncate', action='store_true', help='rerun the whole model for every draw')
     p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
     p.add_argument('--attn-c', type=float, default=0.01)
     p.add_argument('--local-scale', type=int, default=1, help='multiply the ZO local (q, k, v, gate, ve) draws')
@@ -95,12 +99,8 @@ def main():
                           handoff=args.handoff, handoff_draws=args.handoff_draws, oracle=args.oracle,
                           credit=args.credit, attn_c=args.attn_c,
                           res_gamma=args.res_gamma, res_blocks=args.res_blocks)
-        if args.fp32:  # removes bf16 rounding from the loss differences
-            from contextlib import nullcontext
-            estimator.autocast = nullcontext
-            model.transformer.wte.float()
-            for ve in model.value_embeds.values():
-                ve.float()
+        estimator.set_precision('tf32' if args.fp32 else args.precision)
+        estimator.truncate = not args.no_truncate
     else:
         model.requires_grad_(True)
         if args.method == 'ed':  # noise-free DUST: backprop of the expected DUST update
@@ -121,7 +121,12 @@ def main():
     log = (args.output / 'metrics.jsonl').open('w')
     start = time.monotonic()
     ema = None
+    base_lr = [g['lr'] for g in optimizer.param_groups]
     for step in range(1, args.steps + 1):
+        if args.wsd:
+            f = min(1.0, (args.steps - step + 1) / (args.wsd * args.steps))
+            for g, lr in zip(optimizer.param_groups, base_lr):
+                g['lr'] = lr * f
         batch = train[(step - 1) * 8:step * 8].to(device)
         x, y = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
         if estimator is not None:

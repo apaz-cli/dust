@@ -13,7 +13,7 @@ import math
 import torch
 from torch import nn
 
-from model import GPT, GPTConfig, MLP, Block, attention, apply_rotary_emb, has_ve, norm
+from model import GPT, GPTConfig, MLP, Block, attention, apply_rotary_emb, head_loss, has_ve, norm
 
 
 class CrossAttention(nn.Module):
@@ -96,31 +96,43 @@ class YOCO(GPT):
         cos, sin = cos_sin
         return norm(apply_rotary_emb(k, cos, sin)), v
 
-    def forward(self, idx, targets=None, loss_reduction='mean', stop_at_handoff=False):
+    def forward(self, idx, targets=None, loss_reduction='mean', stop_at_handoff=False, start=0, state=None,
+                record=None):
+        """start/state/record as in GPT.forward; state also holds the clean cache (k, v) for start >= n_self."""
         B, T = idx.size()
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
-        x = norm(self.transformer.wte(idx))
-        x0 = x
-        for i in range(self.n_self):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
-        if stop_at_handoff:
-            return x
-        k, v = self.cache(x, cos_sin)
-        x = self.transformer.handoff(x)
-        for i in range(self.n_self, self.config.n_layer):
+        if start:
+            x, x0 = state['x'][start], state['x0']
+        else:
+            x = norm(self.transformer.wte(idx))
+            x0 = x
+        if record is not None:
+            record['x0'], record['x'] = x0, {}
+        if start <= self.n_self:
+            for i in range(start, self.n_self):
+                if record is not None:
+                    record['x'][i] = x
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            if stop_at_handoff:
+                return x
+            k, v = self.cache(x, cos_sin)
+            if record is not None:
+                record['kv'] = (k, v)
+            x = self.transformer.handoff(x)
+        else:
+            k, v = state['kv']
+        for i in range(max(start, self.n_self), self.config.n_layer):
+            if record is not None:
+                record['x'][i] = x
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             x = self.transformer.h[i](x, k, v, cos_sin, self.window_sizes[i])
         x = norm(x)
-        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)
+        raw = self.lm_head(x)
         if targets is not None:
-            return nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1),
-                ignore_index=-1, reduction=loss_reduction,
-            )
-        return logits
+            return head_loss(raw, targets, self.config.vocab_size, loss_reduction)
+        return 15 * torch.tanh(raw[..., :self.config.vocab_size].float() / 15)
 
 
 def build(arch, config, device, seed, n_self=None):

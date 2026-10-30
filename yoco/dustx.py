@@ -27,6 +27,10 @@ class DustX(DUST):
         super().__init__(model, settings, seed)
         self.res_gamma, self.res_blocks = res_gamma, res_blocks
         self.credit_mode, self.attn_c = credit, attn_c
+        self.precision = 'bf16'
+        self.truncate = True
+        self._start = 0
+
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
         self.yoco = hasattr(model, 'n_self')
@@ -37,8 +41,69 @@ class DustX(DUST):
             m = model.transformer.handoff
             self.hooks.append(m.register_forward_hook(self.output_hook('transformer.handoff')))
 
+    def set_precision(self, mode):
+        """'bf16' (stock), 'tf32' (fp32 activations, TF32 matmuls) or 'fast16' (fp16 matmuls and attention,
+        fp32 residual stream, lm_head accumulated and returned in fp32)."""
+        from contextlib import nullcontext
+        self.precision = mode
+        head = self.model.lm_head
+        if mode == 'tf32':
+            self.autocast = nullcontext
+        elif mode == 'fast16':
+            self.autocast = lambda: torch.autocast('cuda', dtype=torch.float16)
+            def head_fwd(x, W=head.weight):
+                with torch.autocast('cuda', enabled=False):
+                    y = torch.mm(x.reshape(-1, x.shape[-1]).half(), W.half().t(), out_dtype=torch.float32)
+                return y.view(*x.shape[:-1], -1)
+            head.forward = head_fwd
+        if mode in ('tf32', 'fast16'):
+            self.model.transformer.wte.float()
+            for ve in self.model.value_embeds.values():
+                ve.float()
+
     # ---- rewards -------------------------------------------------------------------------------
+    def capture(self, x, y):
+        """Clean pass that also records the stream entering every block, for truncated draws."""
+        self.x, self.y = x, y
+        self.batch, self.length = x.shape
+        self.capturing = True
+        self.state, self._reps, self._start = {}, {}, 0
+        try:
+            with self.autocast():
+                self.clean_loss = self.model(x, y, loss_reduction='none', record=self.state).view_as(y).float()
+        finally:
+            self.capturing = False
+
+    def start_for(self, sites):
+        """First block a jitter at these sites can change; draws rerun the model from there."""
+        if not self.truncate:
+            return 0
+        first = []
+        for s in sites:
+            if s.startswith('transformer.h.'):
+                first.append(int(s.split('.')[2]))
+            elif s.startswith('o@'):
+                first.append(int(s[2:]))
+            elif s == 'transformer.handoff':
+                first.append(self.n_self)
+            else:
+                return 0
+        return min(first)
+
+    def rep_state(self, n):
+        if n not in self._reps:
+            st = self.state
+            r = lambda t: t.repeat(n, *([1] * (t.dim() - 1)))
+            self._reps[n] = {'x0': r(st['x0']), 'x': {i: r(t) for i, t in st['x'].items()}}
+            if 'kv' in st:
+                self._reps[n]['kv'] = tuple(r(t) for t in st['kv'])
+        return self._reps[n]
+
     def losses(self, x, y):
+        if self.score is None and self._start:
+            with self.autocast():
+                return self.model(x, y, loss_reduction='none', start=self._start,
+                                  state=self.rep_state(x.shape[0] // self.batch)).view_as(y).float()
         if self.score is None:
             return super().losses(x, y)
         # Linearized loss through the handoff: <g_X, X> per token, X from the self-decoder alone.
@@ -58,6 +123,7 @@ class DustX(DUST):
 
     def direct_errors(self, sites, draws, sigma):  # DUST.direct_errors plus optional residual credit
         """One-sided loss drops, centered across each chunk of draws. """
+        self._start = self.start_for(sites) if self.score is None else 0
         n = self.settings.nrep
         x, y = self.x.repeat(n, 1), self.y.repeat(n, 1)
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
@@ -87,9 +153,52 @@ class DustX(DUST):
                     a.view(n, self.batch, self.length, -1),
                 ).float() / sigma
 
+        self._start = 0
         return {s: error / draws for s, error in errors.items()}
 
-    # ---- head ----------------------------------------------------------------------------------
+    # ---- head ----
+    def head_error(self, draws, sigma=0.05):
+        """DUST.head_error with the loss computed relative to the target logit (arXiv:2610.31642): per token,
+        loss = log1p(sum over non-target j of exp(z_j - z_t)), so confident tokens keep their small rewards."""
+        b, t = self.batch, self.length
+        raw = self.outputs['lm_head']
+        vocab, slab = self.model.config.vocab_size, 256
+        slabs = vocab // slab
+        # Head draws only touch cached logits, so batch many per round; centering is over the batch, per draw.
+        n = max(d for d in (32, 16, 8, 4, 2, 1) if (draws // slabs) % d == 0)
+        logits = 15 * torch.tanh(raw[..., :vocab].float() / 15)
+        target = self.y.clamp(min=0)
+        z_t = logits.gather(-1, target.unsqueeze(-1))                       # [b, t, 1]
+        rel = torch.exp(logits - z_t)
+        rel.scatter_(-1, target.unsqueeze(-1), 0.0)                         # non-target terms only
+        slab_rel = rel.view(b, t, slabs, slab).sum(-1)                      # [b, t, slabs]
+        total_rel = slab_rel.sum(-1)
+        clean = torch.log1p(total_rel)
+        tslab = target // slab
+        error = torch.zeros_like(raw, dtype=torch.float32)
+        rep = lambda x: x.repeat(n, *([1] * (x.dim() - 1)))
+        for chunk in range(draws // n):
+            blk = (chunk * n * slabs // draws) % slabs  # each slab gets draws // slabs draws, n at a time
+            lo = blk * slab
+            a = self.noise(n * b, t, slab)
+            changed = 15 * torch.tanh((raw[..., lo:lo + slab].float().repeat(n, 1, 1) + sigma * a.float()) / 15)
+            in_slab = rep(tslab == blk)                                     # target lies in this slab
+            tgt = rep(target)
+            zt_new = torch.where(in_slab, changed.gather(-1, (tgt - lo).clamp(0, slab - 1).unsqueeze(-1)).squeeze(-1),
+                                 rep(z_t[..., 0]))
+            others = rep(total_rel - slab_rel[..., blk]) * torch.exp(rep(z_t[..., 0]) - zt_new)
+            mine = torch.exp(changed - zt_new.unsqueeze(-1))
+            mine = torch.where(in_slab.unsqueeze(-1) & (torch.arange(lo, lo + slab, device=raw.device) == tgt.unsqueeze(-1)),
+                               0.0, mine)
+            loss = torch.log1p(others + mine.sum(-1)).view(n, b, t)
+            reward = torch.where(self.y.unsqueeze(0) != -1, clean.unsqueeze(0) - loss, 0)
+            if b > 1:
+                reward = reward - reward.mean(1, keepdim=True)
+            error[..., lo:lo + slab] -= torch.einsum(
+                'nbt,nbtd->btd', (reward / sigma).to(self.dtype), a.view(n, b, t, slab),
+            ).float()
+        return error / (draws // slabs)
+
     def exact_head_error(self):
         raw = self.outputs['lm_head'].float()
         vocab = self.model.config.vocab_size
