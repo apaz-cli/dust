@@ -185,3 +185,13 @@
 - best-b16-lr35 (16 seqs x 1500 steps, lr x sqrt2; equal data and compute): 2.911 vs 2.760 -> more, smaller steps win.
 - chain-hubs-wsd2 seed 7: 2.749 -> best derivative-free recipe 2.741 +- .008 (n=2) @ ~1041 s.
 - linv-hubs-wsd2 (gray zone + hub chaining + WSD): 2.706 @ 973 s (linear values alone, constant lr: 2.699, EMA 2.661).
+
+## Night 2 addendum: L8-D512 scale check (3000 steps, fast16, 5090 only)
+
+| Arm | val (EMA) | seconds | night 1 reference |
+|---|---|---|---|
+| best ZO recipe | 2.918 (2.924) | 3552 | best 2.904 @ 7305 s |
+| stock Dust | 3.077 (3.134) | 2778 | stock 3.163 |
+
+The best ZO recipe keeps a 0.16 nat lead over stock at L8 and matches night 1's best in under half the time.
+The stock run gains about 0.09 from fast16 and the CE fix alone.
