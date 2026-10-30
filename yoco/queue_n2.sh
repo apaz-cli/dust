@@ -18,3 +18,4 @@ run quant-master    --arch yoco --method dust $BEST --quant master
 run quant-sr        --arch yoco --method dust $BEST --quant sr
 run best-linv       --arch yoco --method dust $BEST --linear-v
 run best-linv-kvc   --arch yoco --method dust $BEST --linear-v --kv-credit
+run best-ramp-wsd2  --arch yoco --method dust $BEST --draw-ramp --wsd 0.2

@@ -151,3 +151,12 @@
 - exact K/V errors (autograd ruler): cos to TRUE 0.752 -> 0.837 (b0 c_proj), .560 -> .620 (c_fc), wte .558 -> .778, step err ~same.
   => correct bias fix; bottleneck is K/V error quality (per-step cos ~.01-.05).
 ## Allocation probe (alloc_probe.py), best-fast step 500: B_g ~ 300-3000 per group (N << B everywhere: linear regime).
+## Linear values (gray zone: uses attention's linearity in V, like reassemble uses W's): value-error cos to target
+- ZO local (4x): cache .035, b0 .043, b1 .044 | linear: cache .157, b0 .207, b1 .223 (per step, hub4). No V draws.
+- KV credit with linear values, values only: b0 c_proj cos-to-true .752 -> .786, step err 2.21 -> 2.35; wte err +75% (excluded).
+## Delta forward (quantize the perturbation, not the activations), cos to exact own-token error, 64 draws:
+- Dust-trained YOCO: fast16 .332/.332/.323/.297 | fp8 deltas .332/.333/.332/.332 | nvfp4 deltas .328/.330/.329/.329
+- bp-trained YOCO:   fast16 .320/.333/.333/.333 | fp8 .320/.333/.333/.333 | nvfp4 .315/.328/.329/.329
+  => NVFP4 deltas keep ~99% of estimate quality; fp8 deltas even remove fast16's residual deep rounding.
+## Allocation drift (stationary model, x stock-best draws): attn.0 .74 -> 1.03 -> 1.21 (steps 500/1000/2000), attn.1 .14 -> .17 -> .60,
+   head 1.31 -> 1.22 -> 1.02, wte 1.65 -> 1.51 -> 1.24; predicted gain of reallocation 25% -> 22% -> 15%.

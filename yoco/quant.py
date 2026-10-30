@@ -74,3 +74,17 @@ def install(model, mode):
 def requantize(model, stochastic=True):
     for _, m in quant_modules(model):
         m.weight.copy_(quantize(m.weight, stochastic=stochastic))
+
+
+def quantize_rows_fp8(x):
+    """Per-row (last dim) scaled e4m3 fake-quantization."""
+    s = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 448.0
+    return (x / s).to(torch.float8_e4m3fn).float() * s
+
+
+def quantize_delta(x, fmt):
+    """Fake-quantize a perturbation tensor [..., d] with scales fitted to its own magnitude."""
+    if fmt == 'fp8':
+        return quantize_rows_fp8(x.float())
+    flat = x.float().reshape(-1, x.shape[-1])
+    return quantize(flat).reshape(x.shape)

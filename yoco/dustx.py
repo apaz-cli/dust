@@ -32,6 +32,8 @@ class DustX(DUST):
         self._start = 0
         self.linear_v = False        # value errors from the linear attention map (forward probabilities), no draws
         self.kv_credit = False
+        self.delta_fmt = None        # 'fp8' / 'nvfp4': emulate low-precision delta forwards in every draw
+        self._qw = {}
         self.kv_credit_values_only = False
         self.kv_credit_embedding = False       # augment upstream rewards with cross-token credit through estimated K/V errors
         self.kv_strict = {}          # module name -> error at its output, credited from strictly later queries
@@ -84,9 +86,23 @@ class DustX(DUST):
         base = DUST.output_hook(self, name)
 
         def hook(module, args, output):
+            if self.delta_fmt and not self.capturing and isinstance(module, nn.Linear) and name in self.inputs:
+                # delta forward: clean output (cached, exact) + Q(W) Q(input - clean input)
+                from yoco import quant
+                n = args[0].shape[0] // self.batch
+                xc = self.inputs[name].repeat(n, *([1] * (args[0].dim() - 1)))
+                yc = self.outputs[name].float().repeat(n, *([1] * (output.dim() - 1)))
+                key = ('w', name, module.weight._version)
+                if self._qw.get(name, (None,))[0] != key:
+                    self._qw[name] = (key, quant.quantize_delta(module.weight.detach(), self.delta_fmt)
+                                      if self.delta_fmt == 'fp8' else quant.quantize(module.weight.detach()))
+                d = quant.quantize_delta(args[0].float() - xc.float(), self.delta_fmt)
+                output = (yc + d @ self._qw[name][1].float().t()).to(output.dtype)
             out = base(module, args, output)
+            if out is None:
+                out = output
             if name in self._aug and not self.capturing:
-                self._draw_outs[name] = output
+                self._draw_outs[name] = out
             return out
         return hook
 

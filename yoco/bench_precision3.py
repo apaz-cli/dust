@@ -43,9 +43,10 @@ model.requires_grad_(False)
 model.transformer.wte.float()
 for ve in model.value_embeds.values():
     ve.float()
-for prec in ('bf16', 'fast16', 'tf32'):
+for prec in ('fast16', 'delta-fp8', 'delta-nvfp4'):
     est = DustX(model, recipe('10M', 256))
-    est.set_precision(prec)
+    est.set_precision('fast16')
+    est.delta_fmt = {'delta-fp8': 'fp8', 'delta-nvfp4': 'nvfp4'}.get(prec)
     with torch.no_grad():
         est.capture(x, y)
         cs = [F.cosine_similarity(est.direct_errors([s], draws, 0.2)[s].flatten(), exact[s].flatten(), 0).item() for s in sites]

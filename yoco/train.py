@@ -53,6 +53,8 @@ def main():
                    help='NVFP4 block weights: master = fp32 master + quantized forwards; sr = stored in NVFP4, SR updates')
     p.add_argument('--linear-v', action='store_true', help='value errors from the linear attention map (no V draws)')
     p.add_argument('--kv-credit', action='store_true', help='cross-token credit through estimated K/V errors')
+    p.add_argument('--draw-ramp', action='store_true',
+                   help='same total draws, spent late: 0.75x for the first 60%% of steps, then linear 0.75x -> 2x')
     p.add_argument('--wsd', type=float, default=0.0, help='WSD: decay the lr linearly to 0 over this final fraction')
     p.add_argument('--no-truncate', action='store_true', help='rerun the whole model for every draw')
     p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
@@ -141,6 +143,15 @@ def main():
             f = min(1.0, (args.steps - step + 1) / (args.wsd * args.steps))
             for g, lr in zip(optimizer.param_groups, base_lr):
                 g['lr'] = lr * f
+        if args.draw_ramp and estimator is not None:
+            u = (step - 1) / args.steps
+            mult = 0.75 if u < 0.6 else 0.75 + 1.25 * (u - 0.6) / 0.4
+            k = settings.nrep
+            r_ = lambda v: max(k, int(round(v * mult / k)) * k)
+            estimator.settings = replace(settings, writers=[r_(v) for v in settings.writers],
+                                         hidden=[r_(v) for v in settings.hidden], hubs=[r_(v) for v in settings.hubs],
+                                         embedding=r_(settings.embedding),
+                                         local={kk: r_(v) for kk, v in settings.local.items()})
         batch = train[(step - 1) * 8:step * 8].to(device)
         x, y = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
         if estimator is not None:
