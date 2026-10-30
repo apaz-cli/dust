@@ -118,6 +118,9 @@ class DUST:
         self.modules = {n: m for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Embedding))}
         self.inputs, self.outputs, self.jitter = {}, {}, {}
         self.capturing = False
+        # Optional diagnostics: reward_stats[key] = [sum((reward/sigma)^2), count], per direct-error group.
+        # Set to {} to enable; leave None for zero overhead.
+        self.reward_stats = None
 
         counts = settings.writers + settings.hidden + settings.hubs + [settings.embedding]
         counts += list(settings.local.values())
@@ -190,6 +193,14 @@ class DUST:
             reward = self.clean_loss.unsqueeze(0) - perturbed_loss
             if n > 1:
                 reward = reward - reward.mean(0, keepdim=True)
+            if self.reward_stats is not None:
+                key = tuple(sites)
+                st = self.reward_stats.get(key)
+                if st is None:
+                    st = [torch.zeros((), device=self.device, dtype=torch.float32), 0, sigma]
+                    self.reward_stats[key] = st
+                st[0] += (reward.float() / sigma).pow(2).sum()
+                st[1] += reward.numel()
             for site, a in noise.items():
                 errors[site] -= torch.einsum(
                     'nbt,nbtd->btd', reward.to(self.dtype),
