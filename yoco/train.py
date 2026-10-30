@@ -47,6 +47,10 @@ def main():
     p.add_argument('--fp32', action='store_true', help='same as --precision tf32')
     p.add_argument('--precision', choices=['bf16', 'tf32', 'fast16'], default='bf16',
                    help='DUST forwards: bf16 (stock), tf32 (fp32 activations) or fast16 (fp16 matmuls, fp32 stream and logits)')
+    p.add_argument('--alloc', help='explicit draws: JSON {"writers": [...], "hidden": [...], "hubs": [...], '
+                                   '"embedding": n, "head": n}; applied after every scale flag')
+    p.add_argument('--quant', choices=['none', 'master', 'sr'], default='none',
+                   help='NVFP4 block weights: master = fp32 master + quantized forwards; sr = stored in NVFP4, SR updates')
     p.add_argument('--wsd', type=float, default=0.0, help='WSD: decay the lr linearly to 0 over this final fraction')
     p.add_argument('--no-truncate', action='store_true', help='rerun the whole model for every draw')
     p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
@@ -82,6 +86,8 @@ def main():
     settings = replace(settings, writers=[w * args.direct_scale for w in settings.writers],
                        hidden=[w * args.direct_scale for w in settings.hidden],
                        embedding=settings.embedding * args.emb_scale)
+    if args.alloc:
+        settings = replace(settings, **json.loads(args.alloc))
     if args.flat_alloc:
         nrep = settings.nrep
         flat = lambda xs: [max(nrep, round(sum(xs) / len(xs) / nrep) * nrep)] * len(xs)
@@ -93,6 +99,9 @@ def main():
 
     model = build(args.arch, config, device, args.seed, n_self=args.n_self)
     optimizer = make_optimizer(model, settings)
+    if args.quant != 'none':
+        from yoco import quant
+        quant.install(model, args.quant)
     estimator = None
     if args.method == 'dust':
         estimator = DustX(model, settings, args.seed, head=args.head, local=args.local,
@@ -132,6 +141,8 @@ def main():
         if estimator is not None:
             try:
                 loss = estimator.step(x, y, optimizer)
+                if args.quant == 'sr':
+                    quant.requantize(model, stochastic=True)
             except FloatingPointError:
                 loss = math.nan
         else:
