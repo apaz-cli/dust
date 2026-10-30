@@ -136,3 +136,5 @@
 - Seed 7 of fp32-local4-hub4: 2.885 -> best recipe 2.863 +- .03 (n=2) vs stock 3.131 +- .005.
 - L8-D512 stock YOCO DUST: 3.163 (3846 s, context gain .331); bp L8 yoco 1.808-1.866.
 - L8-D512 best (fp32+local4+hub4+emb4): 2.904 vs stock 3.163 (-0.259), 7305 s vs 3846 s (1.9x), context gain .358.
+- Queue 5: emb16 2.744 (vs emb4 2.777, 2644 s) | fp32-local4-hub4-flat 2.952 (vs 2.842: stock front-loaded allocation is better)
+  | yoco-hub4 bf16 alone 3.016 (vs stock 3.131).
