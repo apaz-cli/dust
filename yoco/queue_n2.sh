@@ -15,12 +15,10 @@ run chain-a         --arch yoco --method dust --precision fast16 --chain 256 --l
 run chain-hubs      --arch yoco --method dust --precision fast16 --chain 256 --chain-own --chain-hubs-only --local-scale 4 --emb-scale 4
 run chain-hubs-wsd2 --arch yoco --method dust --precision fast16 --chain 256 --chain-own --chain-hubs-only --local-scale 4 --emb-scale 4 --wsd 0.2
 run stock-fast      --arch yoco --method dust --precision fast16
-run best-pool-wsd2  --arch yoco --method dust $BEST --pool --wsd 0.2
 run alloc-stat      --arch yoco --method dust --precision fast16 --local-scale 4 --alloc '{"writers": [56, 24, 22, 26], "hidden": [68, 28, 28, 22], "hubs": [18, 4, 4, 2], "embedding": 66, "head": 1344}'
 run best-ramp-wsd2  --arch yoco --method dust $BEST --draw-ramp --wsd 0.2
 run quant-master    --arch yoco --method dust $BEST --quant master
 run quant-sr        --arch yoco --method dust $BEST --quant sr
 run best-linv       --arch yoco --method dust $BEST --linear-v
 run stock-wsd2      --arch yoco --method dust --wsd 0.2
-run alloc-stat-hub4 --arch yoco --method dust --precision fast16 --local-scale 4 --alloc '{"writers": [46, 20, 18, 22], "hidden": [56, 22, 22, 18], "hubs": [24, 24, 16, 8], "embedding": 54, "head": 1088}'
-run best-linv-kvc   --arch yoco --method dust $BEST --linear-v --kv-credit
+run best-b16-lr35  --arch yoco --method dust $BEST --batch-seqs 16 --steps 1500 --lr 0.35
