@@ -53,6 +53,8 @@ def main():
                    help='NVFP4 block weights: master = fp32 master + quantized forwards; sr = stored in NVFP4, SR updates')
     p.add_argument('--linear-v', action='store_true', help='value errors from the linear attention map (no V draws)')
     p.add_argument('--chain', type=int, default=0, help='local chaining with this many cheap local draws (implies --pool)')
+    p.add_argument('--chain-own', action='store_true', help='local chaining against each site\'s own (unpooled) estimate')
+    p.add_argument('--chain-hubs-only', action='store_true', help='chain only the hub (o@) errors')
     p.add_argument('--pool', action='store_true', help='residual pooling of writer and embedding estimates')
     p.add_argument('--kv-credit', action='store_true', help='cross-token credit through estimated K/V errors')
     p.add_argument('--draw-ramp', action='store_true',
@@ -118,7 +120,9 @@ def main():
         estimator.set_precision('tf32' if args.fp32 else args.precision)
         estimator.truncate = not args.no_truncate
         estimator.kv_credit = args.kv_credit
-        estimator.pool = args.pool or bool(args.chain)
+        estimator.pool = args.pool or (bool(args.chain) and not args.chain_own)
+        estimator.chain_pool = not args.chain_own
+        estimator.chain_hidden = not args.chain_hubs_only
         estimator.chain = bool(args.chain)
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v

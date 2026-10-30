@@ -34,7 +34,9 @@ class DustX(DUST):
         self.kv_credit = False
         self.pool = False
         self.chain = False           # local chaining (implies pooling): no hidden or hub full-forward draws
-        self.chain_draws = 256            # residual pooling of writer estimates across depths
+        self.chain_draws = 256
+        self.chain_pool = True
+        self.chain_hidden = True     # False: only the hub (o@) errors are chained; MLP hidden keeps direct draws       # score local probes against pooled (biased) or own (unbiased) stream errors            # residual pooling of writer estimates across depths
         self.pool_decay = 0.9
         self._halves, self._pool_ema = {}, {}
         self.delta_fmt = None        # 'fp8' / 'nvfp4': emulate low-precision delta forwards in every draw
@@ -704,13 +706,17 @@ class DustX(DUST):
             for layer in range(L):
                 p = f'transformer.h.{layer}.'
                 direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[layer], 0.2)
+                if not self.chain_hidden:
+                    direct([p + 'mlp.c_fc'], r.hidden[layer], 0.2)
             direct(['transformer.wte'], r.embedding, 0.2)
-            errors = self.pool_writers(errors)
+            if self.chain_pool:
+                errors = self.pool_writers(errors)
             self._halves = {}
             targets = {}
             for layer in range(L):
                 p = f'transformer.h.{layer}.'
-                errors[p + 'mlp.c_fc'] = self.local_mlp(layer, errors[p + 'mlp.c_proj'], self.chain_draws)
+                if self.chain_hidden:
+                    errors[p + 'mlp.c_fc'] = self.local_mlp(layer, errors[p + 'mlp.c_proj'], self.chain_draws)
                 targets[layer] = self.local_proj(layer, errors[p + 'attn.c_proj'], self.chain_draws)
             if self.yoco:
                 for kind in ('q', 'k', 'v'):

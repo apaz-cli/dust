@@ -160,3 +160,12 @@
   => NVFP4 deltas keep ~99% of estimate quality; fp8 deltas even remove fast16's residual deep rounding.
 ## Allocation drift (stationary model, x stock-best draws): attn.0 .74 -> 1.03 -> 1.21 (steps 500/1000/2000), attn.1 .14 -> .17 -> .60,
    head 1.31 -> 1.22 -> 1.02, wte 1.65 -> 1.51 -> 1.24; predicted gain of reallocation 25% -> 22% -> 15%.
+## Residual pooling (writers + embedding pooled across depths; data-driven scales)
+- per-step error vs own target (Dust-trained YOCO): 2.5-16x lower for writers, 8.8x for wte (oracle bound similar).
+- TRAINING: best-pool 2.827 (EMA 2.791) vs best-fast 2.760 -> worse. Joint damage of pooled noise is LOWER (0.0010 vs 0.0027),
+  so not correlated-noise amplification; it is BIAS: pooled error floors at 0.6-0.9 |G|^2 (per-token scale ratios between depths
+  vary; one global scale per pair misweights tokens). Momentum averages noise, never bias.
+## Local chaining (c_fc via local MLP probes, o@ via local c_proj probes, 256 cheap draws, scored vs pooled targets):
+- per-step error vs stock direct draws: c_fc 2.2-8.6x lower, o@ 9-25x lower; no hidden or hub full forwards.
+- unpooled variant (scored vs own writer estimates) is unbiased; queued (chain-own).
+- WSD 0.2 on best-fast: 2.735 vs 2.760 (EMA under WSD: 2.747, no gain).

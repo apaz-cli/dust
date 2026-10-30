@@ -70,9 +70,12 @@ for step in range(steps):
             e[f'o@{i}'] = est.direct_errors([f'o@{i}'], st.hubs[i], 0.2 if i < L // 2 else 0.4)[f'o@{i}']
         pooled = est.pool_writers({k: v for k, v in e.items() if not k.endswith('c_fc') and not k.startswith('o@')})
         est._halves = {}
+        src = e if 'own' in sys.argv else pooled
+        if 'own' in sys.argv:
+            pooled = {k: v for k, v in e.items()}
         for i in range(L):
-            pooled[f'transformer.h.{i}.mlp.c_fc'] = est.local_mlp(i, pooled[f'transformer.h.{i}.mlp.c_proj'], 256)
-            pooled[f'o@{i}'] = est.local_proj(i, pooled[f'transformer.h.{i}.attn.c_proj'], 256)
+            pooled[f'transformer.h.{i}.mlp.c_fc'] = est.local_mlp(i, src[f'transformer.h.{i}.mlp.c_proj'], 256)
+            pooled[f'o@{i}'] = est.local_proj(i, src[f'transformer.h.{i}.attn.c_proj'], 256)
         if step >= warm:
             count += 1
             for s in acc:

@@ -12,8 +12,8 @@ run best-fast       --arch yoco --method dust $BEST
 run best-fast-wsd2  --arch yoco --method dust $BEST --wsd 0.2
 run best-pool       --arch yoco --method dust $BEST --pool
 run chain-a         --arch yoco --method dust --precision fast16 --chain 256 --local-scale 4 --emb-scale 4
-run chain-b         --arch yoco --method dust --precision fast16 --chain 256 --local-scale 4 --emb-scale 4 --direct-scale 2
-run stock-fast-pool --arch yoco --method dust --precision fast16 --pool
+run chain-hubs      --arch yoco --method dust --precision fast16 --chain 256 --chain-own --chain-hubs-only --local-scale 4 --emb-scale 4
+run chain-hubs-wsd2 --arch yoco --method dust --precision fast16 --chain 256 --chain-own --chain-hubs-only --local-scale 4 --emb-scale 4 --wsd 0.2
 run stock-fast      --arch yoco --method dust --precision fast16
 run best-pool-wsd2  --arch yoco --method dust $BEST --pool --wsd 0.2
 run alloc-stat      --arch yoco --method dust --precision fast16 --local-scale 4 --alloc '{"writers": [56, 24, 22, 26], "hidden": [68, 28, 28, 22], "hubs": [18, 4, 4, 2], "embedding": 66, "head": 1344}'
