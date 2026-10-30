@@ -55,6 +55,7 @@ def main():
     p.add_argument('--kv-credit', action='store_true', help='cross-token credit through estimated K/V errors')
     p.add_argument('--draw-ramp', action='store_true',
                    help='same total draws, spent late: 0.75x for the first 60%% of steps, then linear 0.75x -> 2x')
+    p.add_argument('--ema', type=float, default=0.995, help='track an EMA of the weights (eval only); 0 disables')
     p.add_argument('--wsd', type=float, default=0.0, help='WSD: decay the lr linearly to 0 over this final fraction')
     p.add_argument('--no-truncate', action='store_true', help='rerun the whole model for every draw')
     p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
@@ -138,6 +139,17 @@ def main():
     start = time.monotonic()
     ema = None
     base_lr = [g['lr'] for g in optimizer.param_groups]
+    wema = {n: p_.detach().float().clone() for n, p_ in model.named_parameters()} if args.ema else None
+
+    @torch.no_grad()
+    def eval_ema():
+        live = {n: p_.detach().clone() for n, p_ in model.named_parameters()}
+        for n, p_ in model.named_parameters():
+            p_.copy_(wema[n].to(p_.dtype))
+        v = evaluate(model, val)
+        for n, p_ in model.named_parameters():
+            p_.copy_(live[n])
+        return v
     for step in range(1, args.steps + 1):
         if args.wsd:
             f = min(1.0, (args.steps - step + 1) / (args.wsd * args.steps))
@@ -175,8 +187,14 @@ def main():
             log.write(json.dumps(rec) + '\n')
             print(json.dumps(rec), flush=True)
             break
+        if wema is not None and math.isfinite(loss):
+            with torch.no_grad():
+                for n, p_ in model.named_parameters():
+                    wema[n].lerp_(p_.detach().float(), 1 - args.ema)
         if step == 1 or step % args.eval_every == 0 or step == args.steps:
             rec['val_loss'] = evaluate(model, val)
+            if wema is not None and step >= 500:
+                rec['val_loss_ema'] = eval_ema()
             print(json.dumps(rec), flush=True)
         if step in args.save_at:
             save(step)
