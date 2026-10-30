@@ -169,3 +169,10 @@
 - per-step error vs stock direct draws: c_fc 2.2-8.6x lower, o@ 9-25x lower; no hidden or hub full forwards.
 - unpooled variant (scored vs own writer estimates) is unbiased; queued (chain-own).
 - WSD 0.2 on best-fast: 2.735 vs 2.760 (EMA under WSD: 2.747, no gain).
+- chain-a (pooled local chaining, 256 local draws): 2.80-2.82 (EMA 2.756) at step 2500-2600, then DIVERGED (NaN, step 2640);
+  0.59 s/step (local MLP probes at width 1024 cost more than the draws they replace). Dropped.
+- Unpooled chaining (bench, Dust-trained): c_fc 2-4x WORSE than direct draws (writer noise spreads through the MLP map);
+  o@ 4x better at block 0, equal deeper. -> only hub chaining kept as a candidate (chain-hubs).
+## Training results (night 2, YOCO L4-D256, single seed)
+- chain-hubs (hub chaining vs own writer targets, local4, emb4, fast16): 2.771 @ 1040 s; + WSD 0.2: 2.733 @ 1043 s (best).
+- stock-fast (stock recipe, fast16 + fixed CE + truncation): 3.054 @ 828 s (EMA 3.023) vs night-1 stock 3.131 @ 1360 s.
