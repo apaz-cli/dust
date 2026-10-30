@@ -22,3 +22,5 @@ run quant-sr        --arch yoco --method dust $BEST --quant sr
 run best-linv       --arch yoco --method dust $BEST --linear-v
 run stock-wsd2      --arch yoco --method dust --wsd 0.2
 run best-b16-lr35  --arch yoco --method dust $BEST --batch-seqs 16 --steps 1500 --lr 0.35
+run chain-hubs-wsd2-s7 --arch yoco --method dust --precision fast16 --chain 256 --chain-own --chain-hubs-only --local-scale 4 --emb-scale 4 --wsd 0.2 --seed 7
+run linv-hubs-wsd2 --arch yoco --method dust --precision fast16 --chain 256 --chain-own --chain-hubs-only --local-scale 4 --emb-scale 4 --wsd 0.2 --linear-v

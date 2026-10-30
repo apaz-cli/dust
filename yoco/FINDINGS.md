@@ -176,3 +176,12 @@
 ## Training results (night 2, YOCO L4-D256, single seed)
 - chain-hubs (hub chaining vs own writer targets, local4, emb4, fast16): 2.771 @ 1040 s; + WSD 0.2: 2.733 @ 1043 s (best).
 - stock-fast (stock recipe, fast16 + fixed CE + truncation): 3.054 @ 828 s (EMA 3.023) vs night-1 stock 3.131 @ 1360 s.
+- alloc-stat (stationary-model allocation): 2.762 @ 1339 s (EMA 2.743) vs 2.760 @ 1150 s: no gain; cost model underestimated time.
+- best-ramp-wsd2 (equal total draws, spent late): 2.790 vs best-fast-wsd2 2.735: worse; early noise slows learning.
+- quant-master (NVFP4 weights in forward, fp32 master): 2.767 vs 2.760.
+- best-linv (linear values, gray zone): 2.699 @ 1084 s (EMA 2.661) vs best-fast 2.760 -> best of night 2 at constant lr.
+- quant-sr (NVFP4 weights stored, SR updates, no master): 2.951 (EMA 2.917): stable but -0.19 vs master copy (2.767).
+- stock-wsd2 (bf16 stock + WSD): 3.082 @ 779 s vs 3.131 night-1 stock.
+- best-b16-lr35 (16 seqs x 1500 steps, lr x sqrt2; equal data and compute): 2.911 vs 2.760 -> more, smaller steps win.
+- chain-hubs-wsd2 seed 7: 2.749 -> best derivative-free recipe 2.741 +- .008 (n=2) @ ~1041 s.
+- linv-hubs-wsd2 (gray zone + hub chaining + WSD): 2.706 @ 973 s (linear values alone, constant lr: 2.699, EMA 2.661).
