@@ -26,6 +26,7 @@ class DustX(DUST):
                  oracle=(), credit='gamma', attn_c=0.01, res_gamma=0.0, res_blocks=2):
         super().__init__(model, settings, seed)
         self.res_gamma, self.res_blocks = res_gamma, res_blocks
+        self.cache_gamma = None  # credit decay for the shared cache's k/v (default: settings.gamma)
         self.credit_mode, self.attn_c = credit, attn_c
         self.precision = 'bf16'
         self.truncate = True
@@ -45,6 +46,11 @@ class DustX(DUST):
         self.kv_credit_embedding = False       # augment upstream rewards with cross-token credit through estimated K/V errors
         self.kv_strict = {}          # module name -> error at its output, credited from strictly later queries
         self._aug, self._draw_outs = {}, {}
+        self.live_fc = False         # MLP hidden draws jitter only units with positive clean pre-activation
+        self.cv = False              # control variate: per-site ridge memory keyed on the finite-difference head error
+        self.cv_beta, self.cv_warmup = 0.9, 20
+        self._cv, self._cv_P, self._cv_key, self._cv_steps = {}, None, None, 0
+        self.cv_stats = {}           # site -> [sum raw reward^2, sum corrected reward^2] since last read
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
@@ -88,6 +94,62 @@ class DustX(DUST):
                 self.clean_loss = self.model(x, y, loss_reduction='none', record=self.state).view_as(y).float()
         finally:
             self.capturing = False
+        if self.cv:
+            k = self.cv_key()
+            kf = k.reshape(-1, k.shape[-1])
+            P = kf.T @ kf / kf.shape[0]
+            self._cv_P = P if self._cv_P is None else self.cv_beta * self._cv_P + (1 - self.cv_beta) * P
+            self._cv_key = k
+            self._cv_steps += 1
+
+    # ---- control variate (associative credit memory, noise PR #6) -------------------------------
+    def cv_key(self, h=1e-2):
+        """Head error by central finite differences of each token's loss along every raw logit of the cached
+        logits (no draws), mapped to the stream width by the head's weights. The key only shapes the
+        control variate; the estimate's expectation does not depend on it."""
+        V = self.model.config.vocab_size
+        raw = self.outputs['lm_head'][..., :V].float()
+        cap = lambda z: 15 * torch.tanh(z / 15)
+        c = cap(raw)
+        m = c.max(-1, keepdim=True).values
+        e = torch.exp(c - m)
+        Z = e.sum(-1, keepdim=True)
+        tgt = self.y.clamp(min=0).unsqueeze(-1)
+
+        def change(sign):
+            moved = cap(raw + sign * h)
+            d = torch.log1p((torch.exp(moved - m) - e) / Z)
+            return d.scatter_add_(-1, tgt, -(moved.gather(-1, tgt) - c.gather(-1, tgt)))
+
+        err = (change(1) - change(-1)) / (2 * h) * (self.y != -1).unsqueeze(-1)
+        return err @ self.model.lm_head.weight[:V].float()
+
+    def cv_predict(self, site):
+        """Ridge retrieval M k for every token, from earlier steps' estimates; None before any are stored."""
+        st = self._cv.get(site)
+        if st is None:
+            return None
+        P = self._cv_P
+        reg = 0.1 * P.diagonal().mean() * torch.eye(P.shape[0], device=P.device)
+        M = torch.linalg.solve(P + reg, st['S'].T).T
+        st['raw'] = self._cv_key @ M.T
+        return st['raw']
+
+    def cv_update(self, site, g):
+        """Store this step's (unbiased) estimate in the memory, and refit the trust scale out of sample."""
+        k = self._cv_key.reshape(-1, self._cv_key.shape[-1])
+        gf = g.reshape(-1, g.shape[-1])
+        b = self.cv_beta
+        st = self._cv.setdefault(site, dict(S=torch.zeros(gf.shape[1], k.shape[1], device=g.device), num=0., den=0.))
+        if 'raw' in st:
+            raw = st.pop('raw').reshape(-1, gf.shape[1])
+            st['num'] = b * st['num'] + (1 - b) * (gf * raw).sum().item()
+            st['den'] = b * st['den'] + (1 - b) * raw.square().sum().item()
+        st['S'] = b * st['S'] + (1 - b) * gf.T @ k / k.shape[0]
+
+    def cv_alpha(self, site):
+        st = self._cv[site]
+        return min(max(st['num'] / st['den'], 0.0), 1.5) if st['den'] > 0 else 0.0
 
     def output_hook(self, name):
         base = DUST.output_hook(self, name)
@@ -190,9 +252,19 @@ class DustX(DUST):
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
         errors = {s: torch.zeros(self.batch, self.length, width(s), device=self.device) for s in sites}
         halves, chunk = {}, 0
+        masks = {s: self.outputs[s] > 0 for s in sites if self.live_fc and s.endswith('mlp.c_fc')}
+        mus, use_cv = {}, self.cv and self.score is None and not self.res_gamma
+        if use_cv:
+            for s in sites:
+                raw = self.cv_predict(s)
+                if raw is not None and self._cv_steps > self.cv_warmup:
+                    mu = self.cv_alpha(s) * raw
+                    mus[s] = mu * masks[s] if s in masks else mu
 
         for _ in range(draws // n):
             noise = {s: self.noise(n * self.batch, self.length, width(s)) for s in sites}
+            for s, mask in masks.items():
+                noise[s] = noise[s] * mask.repeat(n, 1, 1)
             self.jitter = {s: sigma * a for s, a in noise.items()}
             try:
                 perturbed_loss = self.losses(x, y).view(n, self.batch, self.length)
@@ -202,8 +274,18 @@ class DustX(DUST):
                 self.jitter = {}
 
             reward = self.clean_loss.unsqueeze(0) - perturbed_loss
+            if use_cv:
+                raw_reward = reward - reward.mean(0, keepdim=True) if n > 1 else reward
+                if mus:  # remove the reward the memory predicts: sigma * a . mu per jittered site
+                    reward = reward + sigma * sum(
+                        torch.einsum('nbtd,btd->nbt', noise[s].float().view(n, self.batch, self.length, -1), mu)
+                        for s, mu in mus.items())
             if n > 1:
                 reward = reward - reward.mean(0, keepdim=True)
+            if use_cv:
+                st = self.cv_stats.setdefault(sites[0], [0.0, 0.0])
+                st[0] += raw_reward.square().sum().item()
+                st[1] += reward.square().sum().item()
             if self.res_gamma and any(self.res_site(s) for s in sites):
                 # credit token t's jitter with gamma-discounted later token losses (as DUST does for k/v)
                 t = self.length
@@ -225,7 +307,11 @@ class DustX(DUST):
         if self.pool:
             for site, (h0, h1) in halves.items():
                 self._halves[site] = (h0 * 2 / draws, h1 * 2 / draws)
-        return {s: error / draws for s, error in errors.items()}
+        out = {s: error / draws + mus[s] if s in mus else error / draws for s, error in errors.items()}
+        if use_cv:
+            for s, g in out.items():
+                self.cv_update(s, g)
+        return out
 
     # ---- head ----
     def head_error(self, draws, sigma=0.05):
@@ -485,10 +571,11 @@ class DustX(DUST):
         base = {i: attention(qp[i], kp, vr, m.window_sizes[i][0]) for i in cross}
         pos = torch.arange(t, device=self.device)
         lag = pos[None, :] - pos[:, None]
-        credit = (lag >= 0).float() * self.settings.gamma ** lag.clamp(min=0)
+        cg = self.cache_gamma or self.settings.gamma
+        credit = (lag >= 0).float() * cg ** lag.clamp(min=0)
         W = {i: self.attn_credit(qp[i], kp, t) for i in cross} if self.credit_mode == 'attn' and kind != 'q' else None
         if kind == 'v' and self.linear_v:
-            G = (lag.T >= 0).float() * self.settings.gamma ** lag.T.clamp(min=0).float()   # [u, s]
+            G = (lag.T >= 0).float() * cg ** lag.T.clamp(min=0).float()   # [u, s]
             ev, evs = 0, 0
             for i in cross:
                 P = (qp[i].float().transpose(1, 2) @ kp.float().transpose(1, 2).transpose(-1, -2) / d ** 0.5)

@@ -63,10 +63,15 @@ def main():
     p.add_argument('--batch-seqs', type=int, default=8, help='sequences per step')
     p.add_argument('--wsd', type=float, default=0.0, help='WSD: decay the lr linearly to 0 over this final fraction')
     p.add_argument('--no-truncate', action='store_true', help='rerun the whole model for every draw')
+    p.add_argument('--cache-gamma', type=float, help='credit decay for the YOCO cache k/v (default: --gamma)')
     p.add_argument('--credit', choices=['gamma', 'attn'], default='gamma')
     p.add_argument('--attn-c', type=float, default=0.01)
     p.add_argument('--local-scale', type=int, default=1, help='multiply the ZO local (q, k, v, gate, ve) draws')
     p.add_argument('--head-div', type=int, default=1, help='divide the ZO head draws')
+    p.add_argument('--live-fc', action='store_true', help='MLP hidden draws jitter only live units (noise PR #5)')
+    p.add_argument('--cv', action='store_true', help='control variate from a head-error-keyed credit memory (PR #6)')
+    p.add_argument('--cv-beta', type=float, default=0.9)
+    p.add_argument('--cv-warmup', type=int, default=20)
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
@@ -88,7 +93,8 @@ def main():
     config = GPTConfig(sequence_len=512, n_layer=args.n_layer, n_head=heads, n_kv_head=heads, n_embd=args.n_embd)
     settings = recipe('10M', args.population)
     n = config.n_layer
-    settings = replace(settings, writers=settings.writers[:n], hidden=settings.hidden[:n], hubs=settings.hubs[:n],
+    fit = lambda xs: (xs + [xs[-1]] * n)[:n]  # deeper than the recipe's 8 layers: repeat the last (deepest) count
+    settings = replace(settings, writers=fit(settings.writers), hidden=fit(settings.hidden), hubs=fit(settings.hubs),
                        lr=args.lr, **({'gamma': args.gamma} if args.gamma is not None else {}))
     settings = replace(settings, hubs=[h * args.hub_scale for h in settings.hubs],
                        local={k: v * args.local_scale for k, v in settings.local.items()},
@@ -127,6 +133,9 @@ def main():
         estimator.chain = bool(args.chain)
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
+        estimator.cache_gamma = args.cache_gamma
+        estimator.live_fc, estimator.cv = args.live_fc, args.cv
+        estimator.cv_beta, estimator.cv_warmup = args.cv_beta, args.cv_warmup
         estimator.kv_credit_values_only = args.linear_v  # with linear values, only the value path is clean enough
     else:
         model.requires_grad_(True)
@@ -203,6 +212,10 @@ def main():
                     wema[n].lerp_(p_.detach().float(), 1 - args.ema)
         if step == 1 or step % args.eval_every == 0 or step == args.steps:
             rec['val_loss'] = evaluate(model, val)
+            if estimator is not None and estimator.cv_stats:
+                # share of reward variance the memory removed, per draw group
+                rec['cv_explained'] = {k: round(1 - b / a, 3) for k, (a, b) in estimator.cv_stats.items() if a > 0}
+                estimator.cv_stats = {}
             if wema is not None and step >= 500:
                 rec['val_loss_ema'] = eval_ema()
             print(json.dumps(rec), flush=True)

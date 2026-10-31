@@ -195,3 +195,66 @@
 
 The best ZO recipe keeps a 0.16 nat lead over stock at L8 and matches night 1's best in under half the time.
 The stock run gains about 0.09 from fast16 and the CE fix alone.
+
+## Queue 6 (seed 42, idle 5090): noise PR #5 live-unit c_fc jitter (--live-fc) and PR #6 control variate (--cv)
+- --cv: per-site ridge memory from the head error (central finite differences on cached logits, mapped by lm_head)
+  to the site's estimated error; draws measure error - prediction. Estimate's expectation is unchanged for any memory.
+- Live c_fc share on a DUST-trained YOCO (q5/yoco-hub4): .11 / .27 / .39 / .45 by block.
+- best = fp32+local4+hub4+emb4 (2.777, q3):  +live 2.683 | +cv 2.546 | +live+cv 2.457 (1442 s)
+  | +live+cv with half the draws at blocks 0-1 and wte (writers/hidden 20,16,16,10, emb 20) 2.565 (1242 s).
+- stock + live + cv 2.847 (936 s) vs stock 3.131. Noise-free Dust 2.060, backprop 1.926.
+- Reward variance removed by the memory at step 3000 (best+live+cv): writers b0 .32, b1 .71, b2 .84, b3 .91;
+  c_fc .17-.26; hubs .33/.64/.81/.92; wte .33. Lowest at the early sites, where the draws cost most.
+  Stock bf16: deep writers only .05-.25 (rounding noise is unpredictable).
+- Wall times are on an idle GPU; earlier queues shared it. Timing reruns of stock and best are in queue 7.
+
+## Queue 7: seed 7 and idle-GPU timing
+- best+live+cv: s42 2.457, s7 2.470 -> 2.464 +- .009. half early draws: 2.565, 2.556 -> 2.560 +- .006.
+- Reruns on the idle GPU: best (fp32+local4+hub4+emb4) 2.765 in 1424 s (q3: 2.777); stock 3.130 in 832 s.
+- Wall time vs best: +live+cv 1442 / 1535 s (+1-8%, run-to-run ~6%); half 1242 / 1214 s (0.86x).
+  => half-draw arm is 14% cheaper than best and 0.21 lower. stock+live+cv 2.847 in 936 s (1.12x stock).
+- Gap to noise-free Dust (2.060): best .71 -> live+cv .40.
+
+## Queue 8 (seed 42, idle 5090): early-draw floor with live-fc + cv
+- fp32+local4+hub4 + live+cv, blocks 0-1 writers/hidden and wte draws cut:
+  quarter (10,8 / emb 10) 2.751 in 1039 s | eighth (6,4 / emb 6) 2.804 in 935 s.
+  => quarter matches the old best (2.765, 1424 s) at 0.73x the time.
+- stock + live + cv, half early draws (20,16 / emb 6): 2.934 in 708 s vs stock 3.130 in 832 s (0.85x time, -0.20).
+
+## Night 3: scaling ladder (L4-D256 6.2M / L8-D512 32M / L12-D768 95M params; 3000 steps x 8 x 511 tokens = 12M tokens)
+Fixed token budget at every size, so the larger models are undertrained (L12 bp is no better than L8 bp).
+- L12 lr: Dust lr .25 diverges by step 9; .15 stable (40-step check, better than .1). bp/ed: .05 beats .1.
+
+### Noise-free bias cost (ed vs bp, val @3000; L4/L8 from night 1, 3 seeds; L12 single seed, lr .05)
+| size | bp | ed g.98 (stock target) | ed g1 | bias cost g.98 / g1 |
+|---|---|---|---|---|
+| L4  | 1.926 | 2.060 | 2.031 | .134 / .105 |
+| L8  | 1.860 | 1.971 | 1.954 | .111 / .094 |
+| L12 | 1.871 | 1.981 | 1.961 | .110 / .090 |
+=> the bias cost does not grow from 6M to 95M params; if anything it shrinks slightly.
+- L12 lr .1: bp 1.908, ed g1 1.968, ed g.98 2.123 (g.98 less stable at the higher lr).
+
+### Gamma-credit leakage split (measure_bias.py --gamma; bp-trained YOCO, 2 seqs; k_b = s<t, k_a = s>t)
+- Article estimate g^2/(1-g^2) truncated at T=511: 23.06 (g.98). Residual-stream sites measure k_a 21-23.5 at L4/L8/L12.
+- k/v and cache: k_a lower (5-22; late tokens have little future, so a_ss shrinks), k_b high (6-43).
+- Own-token target cos to true grad (bp-trained): k/v .17-.35, cache k .17 v .31, wte .75-.78, writers .93-.98.
+- g.98 target cos: block k/v .83-.95, value_embeds .88-.94, cache .75-.83, wte .97-.98.
+- L4 gamma sweep (cos / k_b / k_a): cache_k g.9 .53/17.5/2.5 | g.98 .77/32.8/9.6 | g.995 .95/52.9/29.8 | g.999 .997/65/62
+  block0 c_k g.9 .79/7.5/4.1 | g.98 .94/10.2/22.0 | g.995 .99/13.2/77 | g.999 1.0/14.8/180.
+  => the cache's k_a grows ~3x slower in g than residual sites': cache can take a higher gamma for less noise.
+
+### Real Dust at L12 (lr .15, fast16, single seed; another process shared the 5090 from ~04:00, step time stayed flat)
+| size | bp | ed g.98 | best ZO | stock | best wall s | stock wall s |
+|---|---|---|---|---|---|---|
+| L4  | 1.926 | 2.060 | 2.741 (2 seeds) | 3.054 | 1041 | 828 |
+| L8  | 1.860 | 1.971 | 2.918 | 3.077 | 3552 | 2778 |
+| L12 | 1.871 | 1.981 | 2.942 | 3.108 | 8982 | 7160 |
+- Noise cost (best ZO - ed g.98): .68 / .95 / .96. Bias cost .13 / .11 / .11. Noise share of the gap .84 / .90 / .90.
+- Best-vs-stock lead: .31 / .16 / .17 nat. Best costs 1.25x stock's wall time at every size.
+- L12 best-zo step: 3.0 s (L8 1.18 s, L4 0.35 s).
+- Dust-trained L12 (g.98 target): cache k cos .77 (same as bp-trained), block k/v .86-.91, wte .996.
+
+### Per-site gamma in training (L4 best recipe, cache k/v gamma .995, others .98)
+- seeds 42/7: 2.729 / 2.756 (mean 2.742) vs one gamma 2.733 / 2.749 (2.741). No change: the target cos gain
+  (.77 -> .95) is lost in the cache estimator's draw noise.
+- L12 bp-trained own-token cos: block k .17-.18, v .24, cache k .16 v .30, wte .76 (same as L4/L8).
