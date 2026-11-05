@@ -68,6 +68,9 @@ def main():
     p.add_argument('--draw-ramp', action='store_true',
                    help='same total draws, spent late: 0.75x for the first 60%% of steps, then linear 0.75x -> 2x')
     p.add_argument('--ema', type=float, default=0.995, help='track an EMA of the weights (eval only); 0 disables')
+    p.add_argument('--microbatch-size', '--chunk-seqs', dest='microbatch_size', type=int, default=0,
+                   help='Dust: gradient accumulation over microbatches of this many sequences, one optimizer step'
+                        ' (--chunk-seqs: old name, kept until queue_moe6.sh finishes)')
     p.add_argument('--batch-seqs', type=int, default=8, help='sequences per step')
     p.add_argument('--wsd', type=float, default=0.0, help='WSD: decay the lr linearly to 0 over this final fraction')
     p.add_argument('--no-truncate', action='store_true', help='rerun the whole model for every draw')
@@ -222,7 +225,22 @@ def main():
         x, y = split(batch)
         if estimator is not None:
             try:
-                loss = estimator.step(x, y, optimizer)
+                if args.microbatch_size and args.microbatch_size < len(x):
+                    estimator.accum, estimator.accum_valid, losses_ = {}, 0, []
+                    for xc, yc in zip(x.split(args.microbatch_size), y.split(args.microbatch_size)):
+                        losses_.append(estimator.step(xc.contiguous(), yc.contiguous(), optimizer))
+                    grads_, valid_ = estimator.accum, estimator.accum_valid
+                    estimator.accum = None
+                    optimizer.zero_grad(set_to_none=True)
+                    for n_, p_ in model.named_parameters():
+                        g_ = (grads_[n_] / valid_).to(p_.dtype)
+                        if not torch.isfinite(g_).all():
+                            raise FloatingPointError(f'Non-finite estimate for {n_}')
+                        p_.grad = g_
+                    optimizer.step()
+                    loss = sum(losses_) / len(losses_)
+                else:
+                    loss = estimator.step(x, y, optimizer)
                 if args.quant == 'sr':
                     quant.requantize(model, stochastic=True)
             except FloatingPointError:

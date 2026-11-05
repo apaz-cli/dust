@@ -62,6 +62,7 @@ class DustX(DUST):
         for q, m in self.modules_moe.items():
             assert m.hs, 'Dust MoE needs a shared expert: its c_proj output is the layer-output site'
             m.dust = (self, q)
+        self.accum, self.accum_valid = None, 0  # gradient accumulation over microbatches (train.py --microbatch-size)
         self.local_separate = False  # leak-free local k/v/gate/ve: each key's jitter scored alone (closed form)
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
         self.yoco = hasattr(model, 'n_self')
@@ -961,6 +962,11 @@ class DustX(DUST):
             grads.update(self.expected_grads(x, y))
 
         valid = (y != -1).sum()
+        if self.accum is not None:  # microbatch: sum the raw estimates; the caller divides and steps
+            for name, g in grads.items():
+                self.accum[name] = self.accum[name] + g if name in self.accum else g
+            self.accum_valid += valid
+            return self.clean_loss[y != -1].mean().item()
         optimizer.zero_grad(set_to_none=True)
         for name, parameter in self.model.named_parameters():
             g = (grads[name] / valid).to(parameter.dtype)

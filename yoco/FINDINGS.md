@@ -356,3 +356,7 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
 - With separate scoring and gamma 1, Dust learns to copy for the first time (second half 2.65 -> 0.98). The first
   half gets worse (2.82 -> 3.05): a gamma-1 horizon helps the copy and costs plain next-token modeling.
 - TinyStories, sep-l1 gamma 1: 2.714 vs 2.683 at gamma .98 (TinyStories needs no long horizon).
+
+### Dust MoE vs dense by tokens per step (4070, same total tokens, lr .25)
+- 8 seqs x 1500: dense 2.987, MoE 3.085 (+.098) | 32 x 375: dense 3.159, MoE 3.191 (+.032) | 64 x 188: running
+  (first attempt out of memory; now gradient accumulation over microbatches of 32, --microbatch-size).
