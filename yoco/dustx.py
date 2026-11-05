@@ -56,6 +56,13 @@ class DustX(DUST):
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
         self.oracle_re = None  # or a regex on parameter names (diagnostic: which sites' noise costs loss)
+        from yoco.moe import MoE
+        self.modules_moe = {n + '.': m for n, m in model.named_modules() if isinstance(m, MoE)}
+        self.moe_prefixes = list(self.modules_moe)
+        for q, m in self.modules_moe.items():
+            assert m.hs, 'Dust MoE needs a shared expert: its c_proj output is the layer-output site'
+            m.dust = (self, q)
+        self.local_separate = False  # leak-free local k/v/gate/ve: each key's jitter scored alone (closed form)
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
         self.yoco = hasattr(model, 'n_self')
         self.n_self = model.n_self if self.yoco else model.config.n_layer
@@ -444,6 +451,29 @@ class DustX(DUST):
         P = P.masked_fill(~mask, float('-inf')).softmax(-1)
         return (self.attn_c * t * P).clamp(max=1.0)
 
+    @staticmethod
+    def separate_scores(kind, P, eo, values, base, credit, dk=None, dv=None, qp=None, ev=None, eb=None):
+        """Leak-free local scores: every token's jitter scored on its own, all T experiments in one T x T pass.
+
+        P [b,h,u,s] clean attention probabilities (masked entries 0), eo [b,u,h,d] o@ error targets,
+        values [b,s,h,d], base [b,u,h,d] clean output (= P values), credit [s,u] decay for output u -> jitter s.
+        kind 'k': dk [n,b,s,h,d] change of the processed key; one shifted logit per query has a closed form,
+            o'_u - o_u = r (v_s - o_u) / (1 + r),  r = P_us (exp(q_u . dk_s / sqrt(dh)) - 1).
+        kind 'v' / 've' / 'gate': dv [n,b,s,h,d] change of the value row s; o'_u - o_u = P_us dv_s exactly.
+        Returns per-jitter scores [n,b,s,h] = sum_u credit[s,u] * eo_u . (o'_u - o_u).
+        """
+        if kind == 'k':
+            dh = qp.shape[-1]
+            delta = torch.einsum('buhd,nbshd->nbhus', qp, dk) / dh ** 0.5
+            r = P * torch.expm1(delta)
+            if ev is None:  # draw-independent; callers may pass them precomputed
+                ev = torch.einsum('buhd,bshd->bhus', eo, values)
+                eb = torch.einsum('buhd,buhd->bhu', eo, base)
+            S = r / (1 + r) * (ev - eb[..., None])
+        else:
+            S = P * torch.einsum('buhd,nbshd->nbhus', eo, dv)
+        return torch.einsum('nbhus,su->nbsh', S, credit)
+
     def local_errors(self, kind, draws, targets, sigma=0.05):  # DUST.local_errors with a pluggable credit kernel
         """Score attention-output changes against estimated output errors (no derivatives).
 
@@ -491,6 +521,22 @@ class DustX(DUST):
                 credit = self.attn_credit(qp, kp, window)
             clean[i] = q, k, z, ve, qp, kp, values, baseline, credit
 
+        sep, sep_e = {}, {}
+        if self.local_separate and kind != 'q':
+            for i in layers:
+                q, k, z, ve, qp, kp, values, baseline, credit = clean[i]
+                window = self.model.window_sizes[i][0]
+                pos = torch.arange(t, device=self.device)
+                lagus = pos[:, None] - pos[None, :]  # [u, s]
+                mask = (lagus >= 0) & (lagus <= window)
+                logits = torch.einsum('buhd,bshd->bhus', qp.float(), kp.float()) / d ** 0.5
+                P = logits.masked_fill(~mask, float('-inf')).softmax(-1)
+                vf = values.float()
+                sep[i] = P, vf, torch.einsum('bhus,bshd->buhd', P, vf)
+
+        def processed_f(raw):
+            return norm(apply_rotary_emb(raw, cos, sin)).float()
+
         if self.linear_v and kind in ('v', 've'):
             # Values enter attention linearly: e_v[s] = sum_u credit(s, u) p[u, s] e_o[u], from forward quantities.
             for i in layers:
@@ -517,6 +563,30 @@ class DustX(DUST):
                 q, k, z, ve, qp, kp, values, baseline, credit = clean[i]
                 window = self.model.window_sizes[i][0]
                 divisor = sigma
+                if self.local_separate and kind != 'q':
+                    assert self.credit_mode == 'gamma' and not self.kv_credit
+                    P, vf, of = sep[i]
+                    eo = targets[i].float().view(b, t, h, d)
+                    if kind == 'k':
+                        dk = (processed_f((k.unsqueeze(0) + sigma * a.view(n, b, t, h, d)).reshape(n * b, t, h, d))
+                              .view(n, b, t, h, d) - processed_f(k)[None])
+                        if i not in sep_e:
+                            sep_e[i] = (torch.einsum('buhd,bshd->bhus', eo, vf), torch.einsum('buhd,buhd->bhu', eo, of))
+                        score = self.separate_scores('k', P, eo, vf, of, credit, dk=dk, qp=qp.float(),
+                                                     ev=sep_e[i][0], eb=sep_e[i][1])
+                    else:
+                        if kind == 'gate':
+                            dv = ((2 * torch.sigmoid(z + sigma * a) - 2 * torch.sigmoid(z - sigma * a)).unsqueeze(-1)
+                                  * ve)
+                            divisor = 2 * sigma
+                        else:
+                            dv = sigma * a.view(n, b, t, h, d)
+                            if kind == 've':
+                                dv = dv * (2 * torch.sigmoid(z)).unsqueeze(-1)
+                        score = self.separate_scores(kind, P, eo, vf, of, credit, dv=dv.float())
+                    estimate = torch.einsum('nbth,nbthd->bthd', score, a.view(n, b, t, h, -1))
+                    errors[i] += estimate.reshape(b, t, width) / divisor
+                    continue
                 if kind in ('q', 'k'):
                     raw = q if kind == 'q' else k
                     perturbed = processed(
@@ -769,6 +839,9 @@ class DustX(DUST):
 
         def direct(sites, count, sigma):
             if count > 0:
+                if self.moe_prefixes:  # MoE layer: the routed hidden units and gate logits join the hidden draws
+                    sites = sites + [q + suf for q in self.moe_prefixes for s_ in sites if s_ == q + 'c_fc'
+                                     for suf in ('moe', 'gate')]
                 errors.update(self.direct_errors(sites, count, sigma))
 
         def hub(layer):
@@ -878,6 +951,9 @@ class DustX(DUST):
         else:
             errors['lm_head'] = self.head_error(r.head)
 
+        for q in self.moe_prefixes:
+            grads.update(self.modules_moe[q].dust_grads(self, q, errors.pop(q + 'moe'), errors.pop(q + 'gate'),
+                                                        errors[q + 'c_proj']))
         for site, error in errors.items():
             grads[site + '.weight'] = self.reassemble(site, error)
         grads.update(self.scalar_gradients(8))

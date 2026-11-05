@@ -20,12 +20,20 @@ from yoco.dustx import DustX  # noqa: E402
 from yoco.model_yoco import build  # noqa: E402
 
 
+def split(batch, noloss=8192):
+    """Inputs and targets from token rows; tokens >= noloss are real tokens (minus noloss) with no loss."""
+    x = (batch[:, :-1] % noloss).contiguous()
+    y = batch[:, 1:].contiguous()
+    return x, torch.where(y >= noloss, torch.full_like(y, -1), y)
+
+
 @torch.no_grad()
 def evaluate(model, rows, batch_size=32):
     total = 0.0
     for batch in rows.split(batch_size):
+        x, y = split(batch)
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            total += model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous()).item() * len(batch)
+            total += model(x, y).item() * len(batch)
     return total / len(rows)
 
 
@@ -75,8 +83,14 @@ def main():
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
+    p.add_argument('--local-separate', action='store_true', help='leak-free local k/v/gate/ve scoring (closed form)')
     p.add_argument('--oracle-re', help='regex on parameter names given their noise-free expected update')
     p.add_argument('--oracle', nargs='*', default=[], help='groups given their noise-free expected update')
+    p.add_argument('--moe', help='routed MoE MLPs: "E,k,h,hs" (experts, top-k, expert hidden, shared hidden)')
+    p.add_argument('--opt', choices=['sgd', 'adamw'], default='sgd', help='adamw: bp reference optimizer (lr --adam-lr)')
+    p.add_argument('--adam-lr', type=float, default=3e-3)
+    p.add_argument('--moe-lr-mult', type=float, default=1.0, help='lr multiplier for routed expert weights')
+    p.add_argument('--moe-layers', type=int, nargs='*', help='layers that get the MoE (default all)')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
     p.add_argument('--steps', type=int, default=3000)
@@ -115,7 +129,25 @@ def main():
     train = train[order]
 
     model = build(args.arch, config, device, args.seed, n_self=args.n_self)
+    if args.moe:
+        from yoco import moe
+        E, k, h, hs = (int(v) for v in args.moe.split(','))
+        moe.install(model, E, k, h, hs, args.moe_layers)
+        if args.method != 'dust':
+            model.requires_grad_(False)  # build() leaves params frozen; the bp branch re-enables them below
     optimizer = make_optimizer(model, settings)
+    if args.opt == 'adamw':
+        optimizer = torch.optim.AdamW([p_ for p_ in model.parameters()], lr=args.adam_lr, betas=(0.9, 0.95),
+                                      weight_decay=0.0)
+    if args.moe and args.moe_lr_mult != 1.0:
+        expert = {id(p_) for n, p_ in model.named_parameters() if n.endswith(('w_fc', 'w_proj'))}
+        groups = []
+        for g in optimizer.param_groups:
+            a = [p_ for p_ in g['params'] if id(p_) not in expert]
+            b = [p_ for p_ in g['params'] if id(p_) in expert]
+            groups += [dict(params=a, lr=g['lr'])] if a else []
+            groups += [dict(params=b, lr=g['lr'] * args.moe_lr_mult)] if b else []
+        optimizer = torch.optim.SGD(groups, momentum=settings.momentum)
     if args.quant != 'none':
         from yoco import quant
         quant.install(model, args.quant)
@@ -136,6 +168,7 @@ def main():
         estimator.linear_v = args.linear_v
         estimator.cache_gamma = args.cache_gamma
         estimator.oracle_re = args.oracle_re
+        estimator.local_separate = args.local_separate
         estimator.live_fc, estimator.cv = args.live_fc, args.cv
         estimator.cv_beta, estimator.cv_warmup = args.cv_beta, args.cv_warmup
         estimator.kv_credit_values_only = args.linear_v  # with linear values, only the value path is clean enough
@@ -186,7 +219,7 @@ def main():
                                          embedding=r_(settings.embedding),
                                          local={kk: r_(v) for kk, v in settings.local.items()})
         batch = train[(step - 1) * args.batch_seqs:step * args.batch_seqs].to(device)
-        x, y = batch[:, :-1].contiguous(), batch[:, 1:].contiguous()
+        x, y = split(batch)
         if estimator is not None:
             try:
                 loss = estimator.step(x, y, optimizer)
@@ -201,6 +234,9 @@ def main():
             l.backward()
             optimizer.step()
             loss = l.item()
+        if args.moe:
+            moe_load = moe.load_stats(model)
+            moe.balance(model)
         rec = dict(step=step, train_loss=loss, seconds=round(time.monotonic() - start, 1))
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
         if not math.isfinite(loss) or loss > 10 or (step > 50 and ema > 9):
@@ -214,6 +250,8 @@ def main():
                     wema[n].lerp_(p_.detach().float(), 1 - args.ema)
         if step == 1 or step % args.eval_every == 0 or step == args.steps:
             rec['val_loss'] = evaluate(model, val)
+            if args.moe:
+                rec['moe_load'] = moe_load
             if estimator is not None and estimator.cv_stats:
                 # share of reward variance the memory removed, per draw group
                 rec['cv_explained'] = {k: round(1 - b / a, 3) for k, (a, b) in estimator.cv_stats.items() if a > 0}

@@ -266,3 +266,53 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
   o'_u = (o_u + P_us(e^d - 1) v_s) / (1 + P_us(e^d - 1)), d = q_u.a_s/sqrt(dh); values: do_u = P_us a_s.
   All T one-key experiments cost one attention-sized T x T pass per draw, no extra model passes. Removes local kappa:
   ~1+kappa = 20-50x less variance per draw for L4 keys/values (10-1000x on Qwen3 keys).
+
+## Night 5 (plan and reasons: yoco/NIGHT5.md)
+### Track A: leak-free local k/v/gate/ve (--local-separate), check and bench
+- check_separate.py: closed form == brute-force one-key / one-value attention rerun to 1e-15 (float64).
+- bench_separate.py on bp-trained L4 YOCO, exact own-token o@ targets, weight-space rel. error vs reference:
+  variance cut (stock / separate) at N = 8 / 32 / 128 draws: block0 k 35/33/30x, block1 k 49/47/44x,
+  block0 v 27/26/24x, block1 v 32/32/28x, gate 16/13/15x, value_embeds 32/32/29x. Matches 1 + kappa.
+- Cost: about +20% step time at the recipe's local draw count (fp32 T x T einsums; not optimized).
+
+### Track B: MoE under backprop at L4-D256 (RTX 4070; val / EMA, seeds 42 / 7; active hidden matched to dense 1024)
+| config | SGD lr .2 (repo optimizer) | note |
+|---|---|---|
+| dense | 1.901 / 1.937 (EMA 1.836 / 1.881) | |
+| E8 k2 h512 | 1.922 / 1.894 (EMA 1.878 / 1.850) | ties dense within seed noise (~.02-.04) |
+| E16 k2 h256 + shared 512 | 1.958 / 1.978 | expert lr x4: 1.939 / 1.956 |
+| E32 k4 h128 + shared 512 | 1.965 / 1.962 | |
+| E64 k4 h128 + shared 512 | 2.003 / 1.976 | expert lr x4: 1.973 / 1.949 |
+- Under SGD, more and smaller experts are worse, and an expert lr multiplier only partly helps. AdamW runs
+  (queue_moe2.sh) check whether this is the optimizer: each expert sees k/E of the tokens, so SGD steps shrink.
+- Vectorised MoE forward (padded bmm) matches a naive loop to 1e-6 and is 2-6x faster than the first version.
+- Dust on MoE implemented: routed pre-activations (site mlp.moe, width k*h) and selected router logits (mlp.gate,
+  width k) join each layer's hidden draws, with the clean routing held fixed during those draws; expert weight,
+  router and shared-expert estimates are reassembled from the site errors. Needs a shared expert (its c_proj
+  output is the layer-output site). 4070 speed: ~3.0 s/step vs 1.7 s dense (while sharing the GPU).
+
+### Context testbeds (5090, backprop, SGD lr .2)
+- MQAR (data/mqar*, only answers scored): SGD stays exactly at chance (P=128, 32, 8; 2048 or 64 values; lr .2 to
+  1.5). AdamW learns P=8/64-vocab to 1.71 (chance 4.16). The repo's SGD cannot learn associative recall here.
+- TinyStories-repeat (data/tsrepeat: 256 story tokens then the same 256): SGD backprop learns to copy. Val 1.104,
+  first half 2.19, second half 0.045. Writer kappa stays small (block 0 .05-.07, own cos .94); k/v kappa 9-13.
+  Queued: does Dust learn the copy? (queue_n5b.sh: noise-free g.98 / g1, best ZO, stock).
+
+### Track A training (first read)
+- sep-l4-s42 at step 1000: 3.168 vs 3.169 for the same recipe without the flag. The local estimator's own noise was
+  not the binding part: at local-scale 4 it already matched the exact local derivative (night 1). The self-attention
+  oracle gain (.26) comes mostly from the o@ targets, which are chained from the writer estimates.
+- AdamW (bp, betas .9/.95, no wd), val (EMA), seed 42:
+  lr 1e-3: dense 1.837 (1.763) | E8k2 1.760 (1.688) | E16k2+s 1.782 (1.718) | E32k4+s 1.772 (1.703)
+  lr 3e-3: dense 1.773 (1.664) | E8k2 1.711 (1.600) | E16k2+s 1.745 (1.638) | E32k4+s 1.713 (1.611)
+  => under AdamW every MoE beats dense by .03-.08 nat at matched active parameters (the expected small-scale
+  MoE gain). Under SGD it does not. SGD is the reason, and Dust uses SGD: queue_moe4 tries Dust with AdamW.
+- Final (L4 best recipe, seed 42; baseline without the flag 2.733, seed 7 2.749):
+  sep-l4 (local draws x4) 2.679 (EMA 2.689) | sep-l1 (x1, 4x fewer local draws) 2.683 (EMA 2.690).
+  Same at step 1000; the gap opens late (WSD decay), when the update is small and noise matters most.
+  Wall time on a shared GPU: 1677 s (l4) / 1250 s (l1) vs 1043 s; the separate path's fp32 T x T einsums are not
+  optimized (draw-independent e.v / e.o terms now cached).
+- Seeds 42 / 7 (val): sep-l4 2.679 / 2.683 (mean 2.681) | sep-l1 2.683 / 2.692 (mean 2.688, 973 s for seed 7 with the
+  cached terms, vs 1043 s baseline) | baseline l4 2.733 / 2.749 (2.741) | control stock-l1 2.907 (seed 42).
+  => at equal local draws the leak-free estimator wins by .22 nat; at 4x fewer local draws it still beats the
+  recipe by .05 nat and is faster. New best derivative-free L4 recipe: best + --local-separate --local-scale 1.
