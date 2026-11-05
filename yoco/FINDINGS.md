@@ -316,3 +316,43 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
   cached terms, vs 1043 s baseline) | baseline l4 2.733 / 2.749 (2.741) | control stock-l1 2.907 (seed 42).
   => at equal local draws the leak-free estimator wins by .22 nat; at 4x fewer local draws it still beats the
   recipe by .05 nat and is faster. New best derivative-free L4 recipe: best + --local-separate --local-scale 1.
+
+### Does Dust learn to copy? (TinyStories-repeat, L4 YOCO, 3000 steps; val first half / second half)
+| run | val | first half | second half |
+|---|---|---|---|
+| backprop (SGD .2) | 1.104 | 2.126 | 0.049 |
+| noise-free Dust, gamma 1 | 1.169 | 2.216 | 0.090 |
+| noise-free Dust, gamma .98 | 1.342 | 2.401 | 0.251 |
+| real Dust, best ZO recipe | 2.752 | 2.823 | 2.645 |
+| real Dust, stock | 3.055 | 3.046 | 3.014 |
+- Noise-free Dust learns the copy (bias costs .065 nat at gamma 1, .24 at gamma .98: the copy source is 256
+  tokens back, beyond gamma .98's ~50-token horizon). Real Dust does not learn it at all: draw noise, not bias,
+  is what keeps a Dust-trained model from using context here. Matches the user's point that falling kappa in
+  Dust training signals a model that stops using context.
+- Queued (queue_n5d): the same task with leak-free local scoring at gamma .98 and 1.
+
+### Dust on MoE (4070, 1500 steps, E8 k2 h384 + shared 256 vs dense hidden 1024; val)
+| | dense | MoE |
+|---|---|---|
+| backprop SGD .2 | 2.172 | 2.259 |
+| backprop AdamW 3e-3 | 1.986 | 1.966 |
+| Dust best recipe, SGD | 2.987 | 3.085 |
+| Dust best recipe, AdamW 1e-3 | 3.044 | 3.219 |
+- MoE loses under Dust with either optimizer, by more than backprop's gain. Likely reason: a weight's estimate sums
+  error x input over the tokens that use it, so its SNR goes as (tokens using it) / A. Routing shrinks A per token
+  by about the same factor as the tokens per expert (k/E), so per-weight SNR does not improve, while at matched
+  active params each expert weight sees 4x fewer tokens than a dense weight. Routing sparsity cuts the cost of a
+  draw, not its noise per weight. Test queued (queue_moe5): dense MLP as wide as the MoE's total hidden (3328).
+- Wide dense (hidden 3328 = the MoE's total), 1500 steps: backprop SGD 2.190 (dense 2.172, MoE 2.259); Dust 3.126
+  (dense 2.987, MoE 3.085). As predicted, Dust-MoE ~ Dust-wide: at a fixed draw budget, more MLP parameters hurt
+  Dust whether dense or routed. MoE at equal total size is no worse than dense-wide and cheaper per draw, so its
+  value for Dust is draws per FLOP, not lower noise per weight.
+
+### Track A at L8-D512 (night 2 reference: best ZO 2.918, 3552 s)
+- sep-l4 2.842 (EMA 2.855, 4439 s): -0.076 nat. sep-l1 2.934 (3430 s): at L8 the 4x local draws still matter.
+
+### Copy task with leak-free local scoring (local-scale 1; first half / second half)
+- rep-sep-g98 2.649: 2.756 / 2.490 | rep-sep-g1 2.035: 3.045 / **0.983** (old recipe 2.823 / 2.645).
+- With separate scoring and gamma 1, Dust learns to copy for the first time (second half 2.65 -> 0.98). The first
+  half gets worse (2.82 -> 3.05): a gamma-1 horizon helps the copy and costs plain next-token modeling.
+- TinyStories, sep-l1 gamma 1: 2.714 vs 2.683 at gamma .98 (TinyStories needs no long horizon).

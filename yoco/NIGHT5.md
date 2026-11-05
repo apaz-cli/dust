@@ -1,3 +1,17 @@
+# Night 5 results (details and numbers: FINDINGS.md, "Night 5" sections)
+
+1. **Leak-free local k/v/gate/ve works.** Exact closed form (checked to 1e-15); 13-49x less variance per draw.
+   L4: 2.741 -> 2.681 (x4 local draws) or 2.688 at 4x fewer draws and 7% less time (2 seeds each).
+   L8: 2.918 -> 2.842. New flag `--local-separate`.
+2. **Real Dust cannot learn to copy; noise-free Dust can** (TinyStories-repeat). Draw noise, not bias, blocks
+   context use. Leak-free scoring with gamma 1 is the first Dust run that learns the copy (second-half loss
+   2.65 -> 0.98), at some cost to the first half.
+3. **MoE does not help Dust at matched active params** (it does help backprop, but only with AdamW). Per-weight
+   SNR goes as tokens / A, and routing shrinks both by k/E. MoE matches an equally wide dense MLP under Dust and
+   is cheaper per draw: its value is draws per FLOP.
+4. Side findings: the repo's SGD cannot learn MQAR at all (AdamW can); oracle diagnostic says self-attention
+   internals' noise costs the most loss at L4 (0.26 nat).
+
 # Night 5 plan: two tracks (branch `kappa-moe`)
 
 The user allowed both GPUs tonight (the 4070 is power-capped at 100 W). The 5090 (index 0) runs the kappa work and
