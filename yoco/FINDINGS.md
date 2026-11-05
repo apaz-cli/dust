@@ -361,3 +361,4 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
 - 8 seqs x 1500: dense 2.987, MoE 3.085 (+.098) | 32 x 375: dense 3.159, MoE 3.191 (+.032) | 64 x 188: dense 3.297, MoE 3.304 (+.007)
   (first attempt out of memory; now gradient accumulation over microbatches of 32, --microbatch-size).
 - The gap closes with tokens per step but does not flip at equal total tokens.
+- 16:55 2026-11-05: user raised the 4070 power limit 100 W -> 200 W during dust1500-b32-dense (step ~288). Wall times on the 4070 from here on are not comparable to earlier 4070 runs; losses are unaffected.

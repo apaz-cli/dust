@@ -108,6 +108,9 @@ router logits, with routing held fixed during those draws.
   accumulation over microbatches of 32 (`--microbatch-size`), statistically the same estimator. The lr stays at
   0.25 at every batch, so absolute losses rise with fewer, larger steps; the gap is what matters.
 
+**Note:** on 2026-11-05 at about 16:55 the 4070's power limit went from 100 W to 200 W, partway through
+the 1500-step x 32-sequence dense run. 4070 wall times after that are not comparable with earlier ones.
+
 ## Files
 
 - `yoco/dustx.py`: `separate_scores`, `--local-separate` path, MoE sites, `oracle_re`, microbatch accumulation.
