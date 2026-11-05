@@ -75,6 +75,7 @@ def main():
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
+    p.add_argument('--oracle-re', help='regex on parameter names given their noise-free expected update')
     p.add_argument('--oracle', nargs='*', default=[], help='groups given their noise-free expected update')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
@@ -134,6 +135,7 @@ def main():
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
         estimator.cache_gamma = args.cache_gamma
+        estimator.oracle_re = args.oracle_re
         estimator.live_fc, estimator.cv = args.live_fc, args.cv
         estimator.cv_beta, estimator.cv_warmup = args.cv_beta, args.cv_warmup
         estimator.kv_credit_values_only = args.linear_v  # with linear values, only the value path is clean enough

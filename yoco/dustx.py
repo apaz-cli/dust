@@ -13,6 +13,8 @@ Options (all default to stock DUST behaviour where it applies):
 In the YOCO cross-decoder, every site (writers, c_fc, o@, queries) is position-local given a clean cache,
 so plain DUST there is unbiased with zero leakage.
 """
+import re
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -53,6 +55,7 @@ class DustX(DUST):
         self.cv_stats = {}           # site -> [sum raw reward^2, sum corrected reward^2] since last read
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
+        self.oracle_re = None  # or a regex on parameter names (diagnostic: which sites' noise costs loss)
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
         self.yoco = hasattr(model, 'n_self')
         self.n_self = model.n_self if self.yoco else model.config.n_layer
@@ -659,7 +662,9 @@ class DustX(DUST):
         from yoco import expected
         m = self.model
         expected.install(m, self.settings.gamma, cross_full=self.handoff)
-        params = {n: p for n, p in m.named_parameters() if self.group(n) in self.oracle}
+        hit = lambda n: self.group(n) in self.oracle or (self.oracle_re is not None and re.search(self.oracle_re, n))
+        params = {n: p for n, p in m.named_parameters() if hit(n)}
+        fast_head = m.lm_head.__dict__.pop('forward', None)  # fast16's fp32-output mm has no autograd rule
         try:
             with torch.enable_grad(), self.autocast():
                 for p in params.values():
@@ -673,6 +678,8 @@ class DustX(DUST):
                 del blk.attn.forward
             if self.yoco:
                 del m.cache
+            if fast_head is not None:
+                m.lm_head.forward = fast_head
         return {n: g.float() for n, g in zip(params, gs)}
 
     # ---- local chaining: cheap local probes scored against pooled stream errors ------------------------
@@ -874,7 +881,7 @@ class DustX(DUST):
         for site, error in errors.items():
             grads[site + '.weight'] = self.reassemble(site, error)
         grads.update(self.scalar_gradients(8))
-        if self.oracle:
+        if self.oracle or self.oracle_re:
             grads.update(self.expected_grads(x, y))
 
         valid = (y != -1).sum()

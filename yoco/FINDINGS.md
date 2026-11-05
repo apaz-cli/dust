@@ -258,3 +258,11 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
 - seeds 42/7: 2.729 / 2.756 (mean 2.742) vs one gamma 2.733 / 2.749 (2.741). No change: the target cos gain
   (.77 -> .95) is lost in the cache estimator's draw noise.
 - L12 bp-trained own-token cos: block k .17-.18, v .24, cache k .16 v .30, wte .76 (same as L4/L8).
+
+## Night 4: where draw noise costs loss (L4 best ZO recipe 2.733; one group given its noise-free expected update)
+- self-decoder q/k/v/gate/ve 2.473 (-.26) | self writers 2.567 (-.17) | wte 2.607 (-.13) | self c_fc 2.612 (-.12)
+  | cross blocks 2.684 (-.05) | head 2.705 (-.03) | cache k/v 2.725 (-.01). Oracle also removes the o@-target noise.
+- Idea saved for later: leak-free local k/v. Perturb each key alone; softmax with one shifted logit has a closed form,
+  o'_u = (o_u + P_us(e^d - 1) v_s) / (1 + P_us(e^d - 1)), d = q_u.a_s/sqrt(dh); values: do_u = P_us a_s.
+  All T one-key experiments cost one attention-sized T x T pass per draw, no extra model passes. Removes local kappa:
+  ~1+kappa = 20-50x less variance per draw for L4 keys/values (10-1000x on Qwen3 keys).
