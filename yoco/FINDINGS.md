@@ -358,5 +358,6 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
 - TinyStories, sep-l1 gamma 1: 2.714 vs 2.683 at gamma .98 (TinyStories needs no long horizon).
 
 ### Dust MoE vs dense by tokens per step (4070, same total tokens, lr .25)
-- 8 seqs x 1500: dense 2.987, MoE 3.085 (+.098) | 32 x 375: dense 3.159, MoE 3.191 (+.032) | 64 x 188: running
+- 8 seqs x 1500: dense 2.987, MoE 3.085 (+.098) | 32 x 375: dense 3.159, MoE 3.191 (+.032) | 64 x 188: dense 3.297, MoE 3.304 (+.007)
   (first attempt out of memory; now gradient accumulation over microbatches of 32, --microbatch-size).
+- The gap closes with tokens per step but does not flip at equal total tokens.

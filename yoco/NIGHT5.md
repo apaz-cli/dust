@@ -11,7 +11,7 @@ embedding x4, WSD). 5090 for track A and the context tests, 4070 for MoE.
 2. **Real Dust does not learn to copy context; noise-free Dust does.** Draw noise, not bias, blocks context use.
    Leak-free scoring with gamma 1 is the first Dust run that learns the copy (second-half loss 2.65 -> 0.98).
 3. **MoE does not help Dust at 8 sequences per step**, though it helps backprop (with AdamW). The gap shrinks
-   with more tokens per step (+0.098 at 8 sequences, +0.032 at 32); 64 is running.
+   with more tokens per step (+0.098 at 8 sequences, +0.032 at 32, +0.007 at 64) but never flips.
 
 ## Track A (5090): leak-free local scoring
 
@@ -100,8 +100,10 @@ router logits, with routing held fixed during those draws.
 |---|---|---|---|---|
 | 8 | 1500 | 2.987 | 3.085 | +0.098 |
 | 32 | 375 | 3.159 | 3.191 | +0.032 |
-| 64 | 188 | running | running | |
+| 64 | 188 | 3.297 | 3.304 | +0.007 |
 
+  The gap closes steadily but MoE never pulls ahead; at a fixed lr, fewer and larger steps also make both
+  worse. Next test: keep the step count and grow the batch (more total tokens).
   The 64-sequence runs first ran out of memory on the 4070 (the logits at 64 x 2 draws). They now use gradient
   accumulation over microbatches of 32 (`--microbatch-size`), statistically the same estimator. The lr stays at
   0.25 at every batch, so absolute losses rise with fewer, larger steps; the gap is what matters.

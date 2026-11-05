@@ -12,6 +12,6 @@ M="--moe 8,2,384,256"
 BEST="--arch yoco --method dust --precision fast16 --chain 256 --chain-own --chain-hubs-only --local-scale 4 --emb-scale 4 --wsd 0.2"
 run dust-b32-dense 375 $BEST --batch-seqs 32
 run dust-b32-e8k2s 375 $BEST --batch-seqs 32 $M
-run dust-b64-dense 188 $BEST --batch-seqs 64 --chunk-seqs 32
-run dust-b64-e8k2s 188 $BEST --batch-seqs 64 --chunk-seqs 32 $M
+run dust-b64-dense 188 $BEST --batch-seqs 64 --microbatch-size 32
+run dust-b64-e8k2s 188 $BEST --batch-seqs 64 --microbatch-size 32 $M
 echo "$(date +%T) queue6 done"

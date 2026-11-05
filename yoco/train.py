@@ -68,9 +68,8 @@ def main():
     p.add_argument('--draw-ramp', action='store_true',
                    help='same total draws, spent late: 0.75x for the first 60%% of steps, then linear 0.75x -> 2x')
     p.add_argument('--ema', type=float, default=0.995, help='track an EMA of the weights (eval only); 0 disables')
-    p.add_argument('--microbatch-size', '--chunk-seqs', dest='microbatch_size', type=int, default=0,
-                   help='Dust: gradient accumulation over microbatches of this many sequences, one optimizer step'
-                        ' (--chunk-seqs: old name, kept until queue_moe6.sh finishes)')
+    p.add_argument('--microbatch-size', type=int, default=0,
+                   help='Dust: gradient accumulation over microbatches of this many sequences, one optimizer step')
     p.add_argument('--batch-seqs', type=int, default=8, help='sequences per step')
     p.add_argument('--wsd', type=float, default=0.0, help='WSD: decay the lr linearly to 0 over this final fraction')
     p.add_argument('--no-truncate', action='store_true', help='rerun the whole model for every draw')
