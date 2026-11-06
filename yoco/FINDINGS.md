@@ -368,3 +368,10 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
   mostly both models being undertrained at 375/188 steps, not MoE escaping the noise limit.
 - 48 seqs/step x 1500: dense 2.586, MoE 2.659 (+.073). Gap by tokens per step at 1500 steps: 8 -> +.098,
   32 -> +.085, 48 -> +.073. Shrinking slowly (~.004 per 8 seqs; zero near ~150-200 seqs/step if linear), no flip.
+- 8 seqs/step x 1500 on the same data (tinystories-long): dense 3.017, MoE 3.047 (+.030). So on one dataset the
+  gap is +.030 / +.085 / +.073 at 8 / 32 / 48: no trend with tokens per step; data order alone moves it by
+  several hundredths (+.098 on the 24k data). MoE trails dense under Dust everywhere (+.03 to +.09), single seeds.
+
+### Leak-free cache scoring (--cache-separate), bench on the bp-trained copy model (runs/n6/bench_cache.log)
+- variance cut at 8 / 128 draws: cache k 69 / 61x, cache v 50 / 46x. CPU check: two leak-free runs agree at cos .98
+  vs .75-.82 for two stock runs; stock-vs-leak-free .87-.92 (same expectation).

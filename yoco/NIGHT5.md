@@ -10,8 +10,8 @@ embedding x4, WSD). 5090 for track A and the context tests, 4070 for MoE.
    draw, -0.06 nat at L4 (2 seeds), -0.076 nat at L8.
 2. **Real Dust does not learn to copy context; noise-free Dust does.** Draw noise, not bias, blocks context use.
    Leak-free scoring with gamma 1 is the first Dust run that learns the copy (second-half loss 2.65 -> 0.98).
-3. **MoE does not help Dust at 8 sequences per step**, though it helps backprop (with AdamW). The gap shrinks
-   with more tokens per step (+0.098 at 8 sequences, +0.032 at 32, +0.007 at 64) but never flips.
+3. **MoE does not help Dust**, though it helps backprop (with AdamW). It trails dense by 0.03-0.09 at 8, 32 and
+   48 sequences per step, with no clear trend in tokens per step.
 
 ## Track A (5090): leak-free local scoring
 
@@ -107,8 +107,9 @@ router logits, with routing held fixed during those draws.
 - **Fixed 1500 steps, more tokens** (tinystories-long, 72k rows, same validation): 32 seqs/step dense 2.643,
   MoE 2.728 (+0.085, vs +0.098 at 8). More tokens per step barely closes the gap, so the shrinkage above was
   mostly both models undertrained at few steps. 48 seqs/step: dense 2.586, MoE 2.659 (+0.073). The gap
-  shrinks slowly with tokens per step (+0.098 / +0.085 / +0.073 at 8 / 32 / 48) and does not flip.
-  8-seq references on the same data: running.
+  is +0.030 / +0.085 / +0.073 at 8 / 32 / 48 on the same data (8 was +0.098 on the 24k data): no trend with
+  tokens per step; data order moves it by several hundredths. MoE trails dense under Dust everywhere
+  (+0.03 to +0.09, single seeds).
   The 64-sequence runs first ran out of memory on the 4070 (the logits at 64 x 2 draws). They now use gradient
   accumulation over microbatches of 32 (`--microbatch-size`), statistically the same estimator. The lr stays at
   0.25 at every batch, so absolute losses rise with fewer, larger steps; the gap is what matters.
