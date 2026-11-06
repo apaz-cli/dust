@@ -366,3 +366,5 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
 - Fixed 1500 steps, tinystories-long: 32 seqs/step dense 2.643, MoE 2.728 (+.085) vs 8 seqs/step +.098 (24k data).
   4x the tokens per step barely moves the gap. The shrinking gap at equal total tokens (+.098/+.032/+.007) was
   mostly both models being undertrained at 375/188 steps, not MoE escaping the noise limit.
+- 48 seqs/step x 1500: dense 2.586, MoE 2.659 (+.073). Gap by tokens per step at 1500 steps: 8 -> +.098,
+  32 -> +.085, 48 -> +.073. Shrinking slowly (~.004 per 8 seqs; zero near ~150-200 seqs/step if linear), no flip.
