@@ -63,6 +63,7 @@ class DustX(DUST):
             assert m.hs, 'Dust MoE needs a shared expert: its c_proj output is the layer-output site'
             m.dust = (self, q)
         self.accum, self.accum_valid = None, 0  # gradient accumulation over microbatches (train.py --microbatch-size)
+        self.cache_separate = False  # the same leak-free scoring for the YOCO cache k/v (all cross layers)
         self.local_separate = False  # leak-free local k/v/gate/ve: each key's jitter scored alone (closed form)
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
         self.yoco = hasattr(model, 'n_self')
@@ -660,6 +661,38 @@ class DustX(DUST):
             if self.kv_credit:
                 self.kv_strict['transformer.cache_v'] = evs.reshape(b, t, -1)
             return {'transformer.cache_v': ev.reshape(b, t, -1)}
+        if kind != 'q' and self.cache_separate:
+            # Leak-free: each cache row's jitter scored alone against every cross layer (closed form per layer).
+            assert self.credit_mode == 'gamma' and not self.kv_credit
+            vf = vr.float()
+            causal = lag.T >= 0  # [u, s]
+            layer = {}
+            for i in cross:
+                logits = torch.einsum('buhd,bshd->bhus', qp[i].float(), kp.float()) / d ** 0.5
+                P = logits.masked_fill(~causal, float('-inf')).softmax(-1)
+                of = torch.einsum('bhus,bshd->buhd', P, vf)
+                eo = targets[i].float().view(b, t, h, d)
+                extra = (torch.einsum('buhd,bshd->bhus', eo, vf), torch.einsum('buhd,buhd->bhu', eo, of)) \
+                    if kind == 'k' else (None, None)
+                layer[i] = P, eo, of, extra
+            kf = self._processed(kr, t).float()
+            err = torch.zeros(b, t, cfg.n_embd, device=self.device)
+            for _ in range(draws // n):
+                a = self.noise(n, b, t, h * d, dtype=torch.float32)
+                if kind == 'k':
+                    dk = (self._processed((kr.unsqueeze(0) + sigma * a.view(n, b, t, h, d)).reshape(n * b, t, h, d), t)
+                          .float().view(n, b, t, h, d) - kf[None])
+                score = 0
+                for i in cross:
+                    P, eo, of, (ev, eb) = layer[i]
+                    if kind == 'k':
+                        score = score + self.separate_scores('k', P, eo, vf, of, credit, dk=dk, qp=qp[i].float(),
+                                                             ev=ev, eb=eb)
+                    else:
+                        score = score + self.separate_scores('v', P, eo, vf, of, credit,
+                                                             dv=sigma * a.view(n, b, t, h, d))
+                err += torch.einsum('nbth,nbthd->bthd', score, a.view(n, b, t, h, d)).reshape(b, t, -1) / sigma
+            return {f'transformer.cache_{kind}': err / draws}
         if kind == 'q':
             errors = {i: torch.zeros(b, t, cfg.n_embd, device=self.device) for i in cross}
         else:

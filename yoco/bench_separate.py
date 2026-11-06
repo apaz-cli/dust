@@ -5,7 +5,7 @@ estimators have the same expectation; the reference is the separate estimator av
 against the stock estimator at the same large count). Reported per site and draw count: relative error
 ||est - ref||^2 / ||ref||^2 in weight space (error rows reassembled with the site's input). The ratio stock/separate
 is the measured variance cut, to compare with 1 + kappa_local.
-usage: bench_separate.py RUN [REF_DRAWS]
+usage: bench_separate.py RUN [REF_DRAWS] [cache]   (cache: the YOCO cache k/v, scored by every cross layer)
 """
 from pathlib import Path
 import sys
@@ -19,6 +19,7 @@ from yoco.dustx import DustX  # noqa: E402
 
 run = sys.argv[1]
 ref_draws = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
+cache = len(sys.argv) > 3 and sys.argv[3] == 'cache'
 torch.manual_seed(0)
 model = load(run)
 st = recipe('10M', 256)
@@ -32,11 +33,11 @@ with torch.no_grad():
     targets = {i: o_err[i].reshape(o_err[i].shape[0], o_err[i].shape[1], -1) for i in o_err}
 
     def run_est(kind, draws, sep, seed):
-        est.local_separate = sep
+        est.local_separate = est.cache_separate = sep
         est.generator.manual_seed(seed)
-        return est.zo_self_local(kind, draws, targets)
+        return est.zo_cross(kind, draws, targets) if cache else est.zo_self_local(kind, draws, targets)
 
-    for kind in ('k', 'v', 'gate', 've'):
+    for kind in (('k', 'v') if cache else ('k', 'v', 'gate', 've')):
         ref = run_est(kind, ref_draws, True, 1)
         chk = run_est(kind, ref_draws, False, 2)
         G = {s: est.reassemble(s, e) for s, e in ref.items()}

@@ -114,6 +114,15 @@ router logits, with routing held fixed during those draws.
 **Note:** on 2026-11-05 at about 16:55 the 4070's power limit went from 100 W to 200 W, partway through
 the 1500-step x 32-sequence dense run. 4070 wall times after that are not comparable with earlier ones.
 
+## Next (queued: yoco/queue_n6.sh, 5090, starts after the 4070 queue)
+
+1. Leak-free scoring for the YOCO cache (`--cache-separate`): copying goes through the cache, whose estimator
+   still has cross-token leakage (cache-key kappa 10-40). Bench first, then the copy task.
+2. Which sites need the long gamma horizon: gamma 1 everywhere taught the copy but hurt plain next-token
+   modeling (first half 2.82 -> 3.05). gamma 1 on the cache only vs the self-decoder only.
+3. Confirm the copy result: second seed, then L8 with backprop and noise-free references.
+4. (Code, not queued) fp16 / fused separate scoring, to remove its ~25% time cost at L8.
+
 ## Files
 
 - `yoco/dustx.py`: `separate_scores`, `--local-separate` path, MoE sites, `oracle_re`, microbatch accumulation.

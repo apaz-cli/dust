@@ -85,6 +85,7 @@ def main():
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
+    p.add_argument('--cache-separate', action='store_true', help='leak-free scoring for the YOCO cache k/v too')
     p.add_argument('--local-separate', action='store_true', help='leak-free local k/v/gate/ve scoring (closed form)')
     p.add_argument('--oracle-re', help='regex on parameter names given their noise-free expected update')
     p.add_argument('--oracle', nargs='*', default=[], help='groups given their noise-free expected update')
@@ -171,6 +172,7 @@ def main():
         estimator.cache_gamma = args.cache_gamma
         estimator.oracle_re = args.oracle_re
         estimator.local_separate = args.local_separate
+        estimator.cache_separate = args.cache_separate
         estimator.live_fc, estimator.cv = args.live_fc, args.cv
         estimator.cv_beta, estimator.cv_warmup = args.cv_beta, args.cv_warmup
         estimator.kv_credit_values_only = args.linear_v  # with linear values, only the value path is clean enough
