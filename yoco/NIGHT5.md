@@ -117,7 +117,13 @@ router logits, with routing held fixed during those draws.
 **Note:** on 2026-11-05 at about 16:55 the 4070's power limit went from 100 W to 200 W, partway through
 the 1500-step x 32-sequence dense run. 4070 wall times after that are not comparable with earlier ones.
 
-## Next (queued: yoco/queue_n6.sh, 5090, starts after the 4070 queue)
+## Copy task follow-up (queue_n6.sh, 5090): done, results in FINDINGS.md "queue_n6"
+
+Leak-free cache scoring halves the copy loss again (0.98 -> 0.43, 2 seeds). gamma 1 is needed in the
+self-decoder, not the cache: gamma 1 self + .98 cache copies best (second half 0.156; noise-free Dust 0.090;
+backprop 0.049). The first half stays ~2.9-3.0. L8 (untuned) copies worse, 1.46.
+
+## Plan for that follow-up
 
 1. Leak-free scoring for the YOCO cache (`--cache-separate`): copying goes through the cache, whose estimator
    still has cross-token leakage (cache-key kappa 10-40). Bench first, then the copy task.

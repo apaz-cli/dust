@@ -375,3 +375,23 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
 ### Leak-free cache scoring (--cache-separate), bench on the bp-trained copy model (runs/n6/bench_cache.log)
 - variance cut at 8 / 128 draws: cache k 69 / 61x, cache v 50 / 46x. CPU check: two leak-free runs agree at cos .98
   vs .75-.82 for two stock runs; stock-vs-leak-free .87-.92 (same expectation).
+
+## Night 6 / queue_n6 (5090): copy task with leak-free cache scoring; which sites need gamma 1
+All local x1, leak-free self-decoder scoring (--local-separate). val, first half / second half (copyable):
+| run | val | first | second |
+|---|---|---|---|
+| (n5) self leak-free only, gamma 1 | 2.035 | 3.045 | 0.983 |
+| + leak-free cache, gamma 1 everywhere | 1.738 | 3.033 | 0.426 |
+| ... seed 7 | 1.758 | 2.993 | 0.503 |
+| + leak-free cache, gamma .98 everywhere | 2.623 | 2.748 | 2.450 |
+| + leak-free cache, gamma 1 self-decoder, .98 cache | **1.552** | 2.932 | **0.156** |
+| + leak-free cache, gamma .98 self-decoder, 1 cache | 1.906 | 2.893 | 0.879 |
+| L8: backprop (lr .1) | 1.057 | 2.026 | 0.048 |
+| L8: noise-free Dust gamma 1 | 1.116 | 2.145 | 0.061 |
+| L8: leak-free self + cache, gamma 1, local x4 | 2.252 (EMA 2.414) | 3.017 | 1.459 |
+- Leak-free cache scoring roughly halves the copy loss again (0.98 -> 0.43, 2 seeds 0.43 / 0.50).
+- The long horizon is needed in the self-decoder's attention internals, not the cache: gamma 1 self + .98 cache
+  copies best (0.156, close to noise-free Dust's 0.090) and keeps the first half a bit better (2.93).
+- The first half stays ~2.9-3.0 in every gamma-1 run (old recipe 2.82, backprop 2.13).
+- L8 copies worse than L4 (1.46) and its EMA is worse than its final weights (unstable late); not yet tuned
+  (gamma 1 everywhere, same lr as L4).
