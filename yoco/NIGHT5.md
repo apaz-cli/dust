@@ -103,7 +103,10 @@ router logits, with routing held fixed during those draws.
 | 64 | 188 | 3.297 | 3.304 | +0.007 |
 
   The gap closes steadily but MoE never pulls ahead; at a fixed lr, fewer and larger steps also make both
-  worse. Next test: keep the step count and grow the batch (more total tokens).
+  worse.
+- **Fixed 1500 steps, more tokens** (tinystories-long, 72k rows, same validation): 32 seqs/step dense 2.643,
+  MoE 2.728 (+0.085, vs +0.098 at 8). More tokens per step barely closes the gap, so the shrinkage above was
+  mostly both models undertrained at few steps. 48 seqs/step and 8-seq references on the same data: running.
   The 64-sequence runs first ran out of memory on the 4070 (the logits at 64 x 2 draws). They now use gradient
   accumulation over microbatches of 32 (`--microbatch-size`), statistically the same estimator. The lr stays at
   0.25 at every batch, so absolute losses rise with fewer, larger steps; the gap is what matters.

@@ -363,3 +363,6 @@ Fixed token budget at every size, so the larger models are undertrained (L12 bp 
 - The gap closes with tokens per step but does not flip at equal total tokens.
 - 16:55 2026-11-05: user raised the 4070 power limit 100 W -> 200 W during dust1500-b32-dense (step ~288). Wall times on the 4070 from here on are not comparable to earlier 4070 runs; losses are unaffected.
 - queue_moe7 v1 crashed at step 750 (24k training rows ran out at 32 seqs/step); relaunched on tinystories-long (72k rows, same validation) with 32 and 48 seqs/step, plus 8-seq references on the same data.
+- Fixed 1500 steps, tinystories-long: 32 seqs/step dense 2.643, MoE 2.728 (+.085) vs 8 seqs/step +.098 (24k data).
+  4x the tokens per step barely moves the gap. The shrinking gap at equal total tokens (+.098/+.032/+.007) was
+  mostly both models being undertrained at 375/188 steps, not MoE escaping the noise limit.
