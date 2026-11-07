@@ -99,9 +99,10 @@ The rest of the night tested ideas that sounded promising and mostly were not:
 
 The same day, night 1's code was used to test two further noise reductions: perturbing only the MLP hidden units
 that are active ("live"), and a control variate that predicts each site's error from the head's error (computed
-by finite differences on the cached logits) and subtracts the predictable part. Together they took the night-1
-recipe from 2.765 to 2.464 (two seeds). These were never carried over into the faster recipes; the final runs
-combine them (see the end).
+by finite differences on the cached logits) and subtracts the predictable part. The prediction only shapes the
+control variate, so the estimate's expectation does not change. Together they took the night-1 recipe from 2.765
+to 2.464 (two seeds). They were then left out of every faster recipe until the final runs, which is where they
+turned out to be the largest gain of all.
 
 ## Night 3: does the bias grow with scale?
 
@@ -201,15 +202,41 @@ For Dust, what MoE offers is cheaper draws; the noise per weight stays where it 
 The best derivative-free recipe for this setting, as command-line flags to `yoco/train.py`:
 
     --arch yoco --method dust --precision fast16 --chain 256 --chain-own --chain-hubs-only
-    --emb-scale 4 --wsd 0.2 --local-separate --cache-separate --local-scale 1
+    --emb-scale 4 --wsd 0.2 --local-separate --cache-separate --local-scale 1 --live-fc --cv
 
-On a task that needs long-range context, add `--gamma 1 --cache-gamma 0.98`. Whether `--live-fc --cv` belongs
-in it is being tested now.
+(`--local-scale 4` at 8 layers.) On a task that needs long-range context, add `--gamma 1 --cache-gamma 0.98`.
+
+## Final runs
+
+The last runs confirmed the leak-free results and brought back night 1's two forgotten noise reductions, the
+live-unit hidden jitter and the head-error control variate. That combination is the largest single gain of the
+whole project:
+
+| | 4 layers (2 seeds) | 8 layers |
+|---|---|---|
+| stock Dust | 3.131 | 3.163 |
+| night 2 best recipe | 2.741 | 2.918 |
+| + leak-free scoring (self-decoder and cache) | 2.687 | 2.887 |
+| + live hidden units and control variate | **2.364** | **2.352** |
+| backprop | 1.926 | 1.860 |
+
+The control variate also works without leak-free scoring (2.404 at 4 layers), so leak-free scoring adds about
+0.04 on top on TinyStories. On the copy task the combination is what makes the difference:
+
+| copy task, 4 layers | first half | copied half |
+|---|---|---|
+| backprop | 2.13 | 0.05 |
+| noise-free Dust, γ = 1 | 2.22 | 0.09 |
+| real Dust, night 2 best recipe | 2.82 | 2.65 |
+| leak-free, γ = 1 in the self-decoder | 2.93 | 0.16 |
+| + live hidden units and control variate | **2.60** | **0.08** |
+
+Real Dust now copies as well as noise-free Dust, and its plain next-token loss on the first half is better than
+any earlier Dust run. Without the control variate the γ = 1 configuration diverged on a second seed. At 8
+layers, without the control variate, a lower learning rate (0.15) took the copied-half loss from 1.46 to 0.55;
+the 8-layer copy run with the control variate has not been done.
 
 ## Where it stands
-
-Final confirmation runs are in progress (`yoco/queue_final.sh`, `yoco/queue_final2.sh`); their results will be
-added here.
 
 Open problems:
 
@@ -218,7 +245,8 @@ Open problems:
   that use context.
 - The first-half cost of a long credit horizon: γ = 1 lets Dust copy and makes ordinary next-token
   prediction worse.
-- Scale: the copy result has not yet held up at 8 layers.
+- Scale: the copy result at 8 layers needs a lower learning rate, and has not been run with the control
+  variate.
 - Speed: leak-free scoring runs in fp32 and costs about 25% more time at 8 layers; NVFP4 delta forwards are
   measured but unused.
 
@@ -228,3 +256,4 @@ Some lessons about the method of working, for whoever continues:
 - Per-step benchmarks mislead. Momentum averages noise across steps but never bias, so a change that cuts
   per-step error can still lose in training (pooling did).
 - A noise-free version of the method is the most useful ruler there is: it separates bias from noise exactly.
+- Reread the old results. The best idea of the week was found on day two and then dropped by accident.

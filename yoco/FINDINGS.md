@@ -395,3 +395,25 @@ All local x1, leak-free self-decoder scoring (--local-separate). val, first half
 - The first half stays ~2.9-3.0 in every gamma-1 run (old recipe 2.82, backprop 2.13).
 - L8 copies worse than L4 (1.46) and its EMA is worse than its final weights (unstable late); not yet tuned
   (gamma 1 everywhere, same lr as L4).
+
+## Final runs (queue_final.sh, queue_final2.sh; 5090 only; 2026-11-07)
+Final recipe F = best + --local-separate --cache-separate. "lcv" = + --live-fc --cv.
+| run | val (EMA) | first / second half (copy task) |
+|---|---|---|
+| TinyStories L4, F, local x1, seeds 42 / 7 | 2.684 / 2.690 (mean 2.687) | |
+| TinyStories L4, F + lcv, seeds 42 / 7 | **2.346 / 2.382 (mean 2.364)** | |
+| TinyStories L4, night-2 best (local x4) + lcv | 2.404 | |
+| TinyStories L8, F, local x4 | 2.887 (2.898) | |
+| TinyStories L8, F + lcv, local x4 | **2.352** | |
+| copy L4, F, gamma 1 self / .98 cache, seed 7 | diverged at step 1739 | |
+| copy L4, same + lcv (seed 42) | 1.346 | **2.596 / 0.079** |
+| copy L8, F, gamma 1 self / .98 cache, lr .15 | 1.761 (1.808) | 2.962 / 0.553 |
+| copy L8, same, lr .10 | 1.957 (2.013) | 2.978 / 0.919 |
+- live-fc + control variate is the largest single gain of the whole project: L4 2.687 -> 2.364 (2 seeds), L8 2.887 -> 2.352.
+  It also works without leak-free scoring (2.404), so leak-free scoring adds ~.04 on top at L4.
+- On the copy task, + lcv copies as well as noise-free Dust (second half 0.079 vs 0.090) and the first half is
+  better than every earlier Dust run (2.596 vs 2.82 for the old recipe; backprop 2.13).
+- Without lcv the gamma-1 copy config diverged on seed 7. At L8 a lower lr (.15) fixes most of the L8 copy failure
+  (second half 1.459 -> 0.553); .10 is too low.
+- Leak-free cache scoring adds nothing on TinyStories at L4 (2.687 vs 2.688 without it); at L8 F scored 2.887 vs
+  2.842 for self-only leak-free scoring (single seeds).
