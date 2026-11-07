@@ -243,8 +243,8 @@ Open problems:
 - Residual-writer noise. The layers that write to the residual stream are now the main noise source, and
   their noise also feeds the attention targets. Leakage there is small in these models but 3 to 8 in models
   that use context.
-- The first-half cost of a long credit horizon: γ = 1 lets Dust copy and makes ordinary next-token
-  prediction worse.
+- The first-half cost of a long credit horizon: without the control variate, γ = 1 lets Dust copy and makes
+  ordinary next-token prediction worse. With it, the first half improves too (2.60), but that is one seed.
 - Scale: the copy result at 8 layers needs a lower learning rate, and has not been run with the control
   variate.
 - Speed: leak-free scoring runs in fp32 and costs about 25% more time at 8 layers; NVFP4 delta forwards are
