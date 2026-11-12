@@ -24,7 +24,7 @@ cache = len(sys.argv) > 3 and sys.argv[3] == 'cache'
 torch.manual_seed(0)
 model = load(run)
 st = recipe('10M', 256)
-data_dir = sys.argv[4] if len(sys.argv) > 4 else '/home/apaz/git/dust/data/tinystories'
+data_dir = sys.argv[4] if len(sys.argv) > 4 else 'data/tinystories'
 data = torch.load(f'{data_dir}/train.pt', weights_only=True).long()[:8].cuda() % 8192  # no-loss marks off
 x, y = data[:, :-1].contiguous(), data[:, 1:].contiguous()
 o_err = own_o_errors(model, x, y, st.gamma)

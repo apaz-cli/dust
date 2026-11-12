@@ -182,7 +182,7 @@ def main():
     p.add_argument('--K', type=int, default=32)
     p.add_argument('--fp32', action='store_true')
     p.add_argument('--gamma', type=float, help='measure the discounted-credit target and its leakage split')
-    p.add_argument('--data', type=Path, default=Path('/home/apaz/git/dust/data/tinystories/validation.pt'))
+    p.add_argument('--data', type=Path, default=Path('data/tinystories/validation.pt'))
     args = p.parse_args()
     cfg_json = json.loads((args.run / 'config.json').read_text())
     arch = cfg_json['args']['arch']
