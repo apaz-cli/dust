@@ -23,3 +23,9 @@ STOCK = ["--method", "dust"]
 
 def command(data):
     return [PY, "yoco/train.py", "--arch", "yoco", "--data-dir", data]
+
+EXP = "/home/apaz/.mlsweep/experiments"
+# Checkpoints from the headline reruns, used by the measurement sweeps.
+BP_L4 = f"{EXP}/headline_tinystories_l4_20261112_0303_d454/headline_tinystories_l4_armbackprop_seed42/artifacts"
+BP_L8 = f"{EXP}/headline_tinystories_l8_20261112_0303_6261/headline_tinystories_l8_armbackprop_seed42/artifacts"
+BP_COPY = f"{EXP}/headline_copy_l4_20261112_0303_5f7c/headline_copy_l4_armbackprop_seed42/artifacts"

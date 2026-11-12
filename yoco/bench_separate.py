@@ -5,7 +5,7 @@ estimators have the same expectation; the reference is the separate estimator av
 against the stock estimator at the same large count). Reported per site and draw count: relative error
 ||est - ref||^2 / ||ref||^2 in weight space (error rows reassembled with the site's input). The ratio stock/separate
 is the measured variance cut, to compare with 1 + kappa_local.
-usage: bench_separate.py RUN [REF_DRAWS] [cache]   (cache: the YOCO cache k/v, scored by every cross layer)
+usage: bench_separate.py RUN [REF_DRAWS] [cache|self] [DATA_DIR]   (cache: the YOCO cache k/v, scored by every cross layer)
 """
 from pathlib import Path
 import sys
@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dust import recipe  # noqa: E402
 from yoco.bench_local_zo import load, own_o_errors  # noqa: E402
 from yoco.dustx import DustX  # noqa: E402
+from mlsweep.logger import MLSweepLogger  # noqa: E402  (no-op outside an mlsweep worker)
 
 run = sys.argv[1]
 ref_draws = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
@@ -23,11 +24,13 @@ cache = len(sys.argv) > 3 and sys.argv[3] == 'cache'
 torch.manual_seed(0)
 model = load(run)
 st = recipe('10M', 256)
-data = torch.load('data/tinystories/train.pt', weights_only=True).long()[:8].cuda()
+data_dir = sys.argv[4] if len(sys.argv) > 4 else '/home/apaz/git/dust/data/tinystories'
+data = torch.load(f'{data_dir}/train.pt', weights_only=True).long()[:8].cuda() % 8192  # no-loss marks off
 x, y = data[:, :-1].contiguous(), data[:, 1:].contiguous()
 o_err = own_o_errors(model, x, y, st.gamma)
 est = DustX(model, st, seed=3)
 est.set_precision('fast16')
+record = {}
 with torch.no_grad():
     est.capture(x, y)
     targets = {i: o_err[i].reshape(o_err[i].shape[0], o_err[i].shape[1], -1) for i in o_err}
@@ -53,5 +56,11 @@ with torch.no_grad():
                     for s in ref:
                         acc[s][j] += rel(e[s], s) / reps
             for s, (a, c) in acc.items():
+                site = s.replace('transformer.', '')
+                record[f'{kind}/{site}/N{N}/stock'] = a
+                record[f'{kind}/{site}/N{N}/separate'] = c
+                record[f'{kind}/{site}/N{N}/cut'] = a / max(c, 1e-12)
                 print(f'{kind:4s} {s:30s} N={N:4d} stock {a:8.3f} separate {c:8.3f}  cut {a / max(c, 1e-12):6.1f}x',
                       flush=True)
+with MLSweepLogger() as logger:
+    logger.log(record, step=1)

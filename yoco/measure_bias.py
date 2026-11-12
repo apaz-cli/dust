@@ -17,6 +17,7 @@ article's equal-signal estimate sum_{s>t} g^(2(s-t)) (truncated at the sequence 
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -27,6 +28,7 @@ from torch.nn import functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dust import GPTConfig  # noqa: E402
 from yoco.model_yoco import build  # noqa: E402
+from mlsweep.logger import MLSweepLogger  # noqa: E402  (no-op outside an mlsweep worker)
 
 
 class Probe:
@@ -180,7 +182,7 @@ def main():
     p.add_argument('--K', type=int, default=32)
     p.add_argument('--fp32', action='store_true')
     p.add_argument('--gamma', type=float, help='measure the discounted-credit target and its leakage split')
-    p.add_argument('--data', type=Path, default=Path('data/tinystories/validation.pt'))
+    p.add_argument('--data', type=Path, default=Path('/home/apaz/git/dust/data/tinystories/validation.pt'))
     args = p.parse_args()
     cfg_json = json.loads((args.run / 'config.json').read_text())
     arch = cfg_json['args']['arch']
@@ -202,8 +204,12 @@ def main():
     keys = per[0].keys()
     summary = {s: {m: sum(q[s][m] for q in per) / len(per) for m in per[0][s]} for s in keys}
     res = dict(run=str(args.run), step=args.step, arch=arch, gamma=args.gamma, sequences=args.sequences, sites=summary)
-    outp = args.run / (f'bias_step{args.step}.json' if args.gamma is None else f'bias_step{args.step}_g{args.gamma}.json')
+    out_dir = Path(os.environ['MLSWEEP_RUN_DIR']) if 'MLSWEEP_RUN_DIR' in os.environ else args.run
+    outp = out_dir / (f'bias_step{args.step}.json' if args.gamma is None else f'bias_step{args.step}_g{args.gamma}.json')
     outp.write_text(json.dumps(res, indent=1))
+    with MLSweepLogger() as logger:  # one record: '<metric>/<site>', site without the 'transformer.' prefix
+        logger.log({f"{m}/{site.replace('transformer.', '')}": float(v) for site, r in summary.items()
+                    for m, v in r.items() if m != 'norm'}, step=1)
     for s, r in summary.items():
         print(f'{s:34s} ' + ' '.join(f'{m}={v:.4f}' for m, v in r.items() if m != 'norm'))
 
