@@ -7,9 +7,17 @@ import argparse
 from dataclasses import asdict, replace
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
+
+# Under mlsweep, runs on different GPUs compile at the same time; a shared inductor/triton cache then races
+# ("Unknown key: 'cubin'"). Give each run its own cache before torch is imported.
+if 'MLSWEEP_RUN_NAME' in os.environ:
+    _cache = f"/tmp/torchinductor_{os.environ['MLSWEEP_RUN_NAME']}"
+    os.environ.setdefault('TORCHINDUCTOR_CACHE_DIR', _cache)
+    os.environ.setdefault('TRITON_CACHE_DIR', _cache + '/triton')
 
 import torch
 
@@ -18,6 +26,7 @@ from dust import GPTConfig, make_optimizer, recipe  # noqa: E402
 from yoco import expected  # noqa: E402
 from yoco.dustx import DustX  # noqa: E402
 from yoco.model_yoco import build  # noqa: E402
+from mlsweep.logger import MLSweepLogger  # noqa: E402  (no-op outside an mlsweep worker)
 
 
 def split(batch, noloss=8192):
@@ -102,7 +111,7 @@ def main():
     p.add_argument('--eval-every', type=int, default=100)
     p.add_argument('--save-at', type=int, nargs='*', default=[])
     p.add_argument('--data-dir', type=Path, default=Path('data/tinystories'))
-    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--output', type=Path, help='run folder (default: $MLSWEEP_RUN_DIR under mlsweep)')
     args = p.parse_args()
 
     device = torch.device('cuda')
@@ -183,7 +192,12 @@ def main():
             if args.ed_own_layers is not None:
                 for i, blk in enumerate(model.transformer.h):
                     blk.attn.ed_stream = 'own' if i in args.ed_own_layers else 'full'
+    if args.output is None:
+        if 'MLSWEEP_RUN_DIR' not in os.environ:
+            p.error('--output is required outside mlsweep')
+        args.output = Path(os.environ['MLSWEEP_RUN_DIR'])
     args.output.mkdir(parents=True, exist_ok=True)
+    logger = MLSweepLogger()
     (args.output / 'config.json').write_text(json.dumps(dict(
         args={k: str(v) for k, v in vars(args).items()}, model=asdict(config), recipe=asdict(settings),
         n_params=sum(q.numel() for q in model.parameters())), indent=1) + '\n')
@@ -262,6 +276,7 @@ def main():
             rec['diverged'] = True
             log.write(json.dumps(rec) + '\n')
             print(json.dumps(rec), flush=True)
+            logger.log({'diverged': 1.0, 'train_loss': loss if math.isfinite(loss) else 99.0}, step=step)
             break
         if wema is not None and math.isfinite(loss):
             with torch.no_grad():
@@ -282,8 +297,41 @@ def main():
             save(step)
         log.write(json.dumps(rec) + '\n')
         log.flush()
+        logger.log(scalars(rec), step=step)
     if args.steps not in args.save_at:
         save(args.steps)
+    if 'tsrepeat' in str(args.data_dir) and not rec.get('diverged'):
+        first, second = halves(model, val)
+        logger.log({'val_first_half': first, 'val_second_half': second}, step=rec['step'])
+        print(json.dumps(dict(val_first_half=first, val_second_half=second)), flush=True)
+    logger.close()
+
+
+def scalars(rec):
+    """The numbers in a training record that mlsweep can plot (nested dicts flattened, lists summarized)."""
+    out = {}
+    for k, v in rec.items():
+        if k == 'step':
+            continue
+        if isinstance(v, dict):
+            out.update({f'{k}/{kk}': float(vv) for kk, vv in v.items()})
+        elif isinstance(v, list):
+            out[f'{k}_max'] = float(max(v))
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = float(v)
+    return out
+
+
+@torch.no_grad()
+def halves(model, rows, n=64):
+    """TinyStories-repeat: mean loss on the first half of each row (plain LM) and the copyable second half."""
+    L = []
+    for batch in rows[:n].split(32):
+        x, y = split(batch)
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            L.append(model(x, y, loss_reduction='none').float().view(len(batch), -1))
+    L = torch.cat(L)
+    return L[:, :255].mean().item(), L[:, 256:].mean().item()
 
 
 if __name__ == '__main__':
