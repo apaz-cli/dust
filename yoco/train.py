@@ -104,6 +104,8 @@ def main():
     p.add_argument('--adam-lr', type=float, default=3e-3)
     p.add_argument('--adam-beta2', type=float, default=0.95)
     p.add_argument('--adam-eps', type=float, default=1e-8)
+    p.add_argument('--router-lr-mult', type=float, default=1.0, help='lr multiplier for MoE router weights (AdamW)')
+    p.add_argument('--moe-balance-rate', type=float, default=1e-3, help='step of the load-balancing bias per update')
     p.add_argument('--moe-lr-mult', type=float, default=1.0, help='lr multiplier for routed expert weights')
     p.add_argument('--moe-layers', type=int, nargs='*', help='layers that get the MoE (default all)')
     p.add_argument('--n-layer', type=int, default=4)
@@ -147,13 +149,17 @@ def main():
     if args.moe:
         from yoco import moe
         E, k, h, hs = (int(v) for v in args.moe.split(','))
-        moe.install(model, E, k, h, hs, args.moe_layers)
+        for m_ in moe.install(model, E, k, h, hs, args.moe_layers):
+            m_.rate = args.moe_balance_rate
         if args.method != 'dust':
             model.requires_grad_(False)  # build() leaves params frozen; the bp branch re-enables them below
     optimizer = make_optimizer(model, settings)
     if args.opt == 'adamw':
-        optimizer = torch.optim.AdamW([p_ for p_ in model.parameters()], lr=args.adam_lr,
-                                      betas=(0.9, args.adam_beta2), eps=args.adam_eps, weight_decay=0.0)
+        router = [p_ for n_, p_ in model.named_parameters() if 'mlp.router' in n_]
+        rest = [p_ for n_, p_ in model.named_parameters() if 'mlp.router' not in n_]
+        groups_ = [dict(params=rest)] + ([dict(params=router, lr=args.adam_lr * args.router_lr_mult)] if router else [])
+        optimizer = torch.optim.AdamW(groups_, lr=args.adam_lr, betas=(0.9, args.adam_beta2), eps=args.adam_eps,
+                                      weight_decay=0.0)
     if args.moe and args.moe_lr_mult != 1.0:
         expert = {id(p_) for n, p_ in model.named_parameters() if n.endswith(('w_fc', 'w_proj'))}
         groups = []
