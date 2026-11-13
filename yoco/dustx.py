@@ -63,6 +63,8 @@ class DustX(DUST):
             assert m.hs, 'Dust MoE needs a shared expert: its c_proj output is the layer-output site'
             m.dust = (self, q)
         self.accum, self.accum_valid = None, 0  # gradient accumulation over microbatches (train.py --microbatch-size)
+        self.freeze_attn = False  # residual-stream draws: hold every later attention output (and the cache) clean
+        self._frozen = set()
         self.cache_separate = False  # the same leak-free scoring for the YOCO cache k/v (all cross layers)
         self.local_separate = False  # leak-free local k/v/gate/ve: each key's jitter scored alone (closed form)
         self.head_mode, self.local_mode, self.handoff = head, local, handoff
@@ -167,6 +169,10 @@ class DustX(DUST):
         base = DUST.output_hook(self, name)
 
         def hook(module, args, output):
+            if name in self._frozen and not self.capturing:
+                # attention held at its clean output: a residual-stream move then reaches only its own token's loss
+                n = output.shape[0] // self.batch
+                return self.outputs[name].repeat(n, *([1] * (output.dim() - 1))).to(output.dtype)
             if self.delta_fmt and not self.capturing and isinstance(module, nn.Linear) and name in self.inputs:
                 # delta forward: clean output (cached, exact) + Q(W) Q(input - clean input)
                 from yoco import quant
@@ -256,8 +262,28 @@ class DustX(DUST):
             return int(site.split('.')[2]) < self.res_blocks
         return False
 
+    def frozen_for(self, sites):
+        """Attention outputs (and YOCO's cache) a draw at these sites should hold clean, for freeze_attn: every
+        attention output from the first perturbed block on, except where the draw perturbs that attention itself."""
+        L = self.model.config.n_layer
+        first = self.start_for(sites) if self.truncate else 0
+        if any(not (s.startswith('transformer.h.') or s.startswith('o@')) for s in sites):
+            first = 0  # the embedding feeds block 0's attention
+        out = {f'transformer.h.{j}.attn.c_proj' for j in range(first, L)
+               if f'transformer.h.{j}.attn.c_proj' not in sites and f'o@{j}' not in sites}
+        if self.yoco and first < self.n_self:
+            out |= {'transformer.cache_k', 'transformer.cache_v'}
+        return out
+
     def direct_errors(self, sites, draws, sigma):  # DUST.direct_errors plus optional residual credit
         """One-sided loss drops, centered across each chunk of draws. """
+        self._frozen = self.frozen_for(sites) if self.freeze_attn and self.score is None else set()
+        try:
+            return self._direct_errors(sites, draws, sigma)
+        finally:
+            self._frozen = set()
+
+    def _direct_errors(self, sites, draws, sigma):
         self._start = self.start_for(sites) if self.score is None else 0
         n = self.settings.nrep
         x, y = self.x.repeat(n, 1), self.y.repeat(n, 1)
