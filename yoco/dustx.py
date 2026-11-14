@@ -65,6 +65,8 @@ class DustX(DUST):
         self.accum, self.accum_valid = None, 0  # gradient accumulation over microbatches (train.py --microbatch-size)
         self.readout = False  # cross-token readout: reward each draw's token t also for later tokens' predicted loss change
         self.readout_targets = None  # {layer: attention-output (o@) errors [b, t, n_embd]} the readout scores against
+        self.readout_scale = 1.0  # weight of the readout term in each draw's reward
+        self.readout_warmup, self._steps = 0, 0  # steps before the readout turns on (its targets start as noise)
         self._ro_names, self._ro_clean = set(), {}
         self.freeze_attn = False  # residual-stream draws: hold every later attention output (and the cache) clean
         self._frozen = set()
@@ -401,7 +403,7 @@ class DustX(DUST):
                 if self._aug:
                     perturbed_loss = perturbed_loss + self.aug_loss(n)
                 if self._ro_names:
-                    perturbed_loss = perturbed_loss + self.readout_loss(n)
+                    perturbed_loss = perturbed_loss + self.readout_scale * self.readout_loss(n)
             finally:
                 self.jitter = {}
 
@@ -1021,7 +1023,8 @@ class DustX(DUST):
             self._aug, self._draw_outs = {}, {}
             return self.finish(x, y, optimizer, errors)
 
-        if self.readout and self.chain and not self.chain_pool and self.chain_hidden is False and not self.handoff:
+        self._steps += 1
+        if self.readout and self._steps > self.readout_warmup and self.chain and not self.chain_pool and self.chain_hidden is False and not self.handoff:
             # Cross-token readout: blocks top-down, so every reader's attention-output target (chained from its
             # block's own c_proj error) exists before a lower block's draws are scored against it.
             targets = {}

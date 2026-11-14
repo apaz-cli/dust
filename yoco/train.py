@@ -98,6 +98,8 @@ def main():
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
     p.add_argument('--freeze-attn', action='store_true', help='residual-stream draws hold later attention and the cache clean')
     p.add_argument('--readout', action='store_true', help='cross-token readout: each draw also scores the closed-form change of later tokens\' attention outputs from its own keys and values (needs --chain --chain-own --chain-hubs-only)')
+    p.add_argument('--readout-scale', type=float, default=1.0, help='weight of the readout term in each draw\'s reward')
+    p.add_argument('--readout-warmup', type=int, default=0, help='steps of plain Dust before --readout turns on')
     p.add_argument('--cache-separate', action='store_true', help='leak-free scoring for the YOCO cache k/v too')
     p.add_argument('--local-separate', action='store_true', help='leak-free local k/v/gate/ve scoring (closed form)')
     p.add_argument('--oracle-re', help='regex on parameter names given their noise-free expected update')
@@ -189,6 +191,8 @@ def main():
         estimator.chain_hidden = not args.chain_hubs_only
         estimator.chain = bool(args.chain)
         estimator.readout = args.readout
+        estimator.readout_warmup = args.readout_warmup
+        estimator.readout_scale = args.readout_scale
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
         estimator.cache_gamma = args.cache_gamma
