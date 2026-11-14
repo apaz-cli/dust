@@ -77,6 +77,8 @@ def main():
     p.add_argument('--draw-ramp', action='store_true',
                    help='same total draws, spent late: 0.75x for the first 60%% of steps, then linear 0.75x -> 2x')
     p.add_argument('--ema', type=float, default=0.995, help='track an EMA of the weights (eval only); 0 disables')
+    p.add_argument('--clip', type=float, default=0.0,
+                   help='adaptive clipping: scale a step whose gradient norm exceeds CLIP x its running average (0: off)')
     p.add_argument('--microbatch-size', type=int, default=0,
                    help='Dust: gradient accumulation over microbatches of this many sequences, one optimizer step')
     p.add_argument('--batch-seqs', type=int, default=8, help='sequences per step')
@@ -222,6 +224,27 @@ def main():
     ema = None
     high = 0  # consecutive steps with training loss above 10
     base_lr = [g['lr'] for g in optimizer.param_groups]
+    clip_state = dict(avg=None, norm=0.0, clipped=0.0, steps=0)
+    if args.clip:
+        # Wrap the optimizer's step so every path (Dust, microbatches, backprop) is clipped the same way. The limit is
+        # CLIP times an average of recent (clipped) gradient norms; the first 20 steps only build the average.
+        raw_step = optimizer.step
+
+        def clipped_step(*a, **kw):
+            grads = [p_.grad for p_ in model.parameters() if p_.grad is not None]
+            norm = torch.sqrt(sum(g.float().square().sum() for g in grads)).item()
+            st = clip_state
+            st['steps'] += 1
+            limit = args.clip * st['avg'] if st['avg'] is not None else math.inf
+            st['norm'], st['clipped'] = norm, 0.0
+            if st['steps'] > 20 and norm > limit:
+                for g in grads:
+                    g.mul_(limit / norm)
+                st['clipped'] = 1.0
+            kept = min(norm, limit)
+            st['avg'] = kept if st['avg'] is None else 0.95 * st['avg'] + 0.05 * kept
+            return raw_step(*a, **kw)
+        optimizer.step = clipped_step
     wema = {n: p_.detach().float().clone() for n, p_ in model.named_parameters()} if args.ema else None
 
     @torch.no_grad()
@@ -282,6 +305,8 @@ def main():
             moe_load = moe.load_stats(model)
             moe.balance(model)
         rec = dict(step=step, train_loss=loss, seconds=round(time.monotonic() - start, 1))
+        if args.clip:
+            rec['grad_norm'], rec['clipped'] = clip_state['norm'], clip_state['clipped']
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
         high = high + 1 if loss > 10 else 0
         # diverged: a non-finite loss, the loss above 10 for 5 steps in a row (a single spike may recover), or the
