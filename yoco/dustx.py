@@ -144,8 +144,13 @@ class DustX(DUST):
         if st is None:
             return None
         P = self._cv_P
-        reg = 0.1 * P.diagonal().mean() * torch.eye(P.shape[0], device=P.device)
-        M = torch.linalg.solve(P + reg, st['S'].T).T
+        if not (torch.isfinite(P).all() and torch.isfinite(st['S']).all()):
+            return None  # a non-finite memory (after a bad step): no prediction this step, the draws do it all
+        reg = (0.1 * P.diagonal().mean() + 1e-12) * torch.eye(P.shape[0], device=P.device)
+        try:
+            M = torch.linalg.solve(P + reg, st['S'].T).T
+        except torch.linalg.LinAlgError:
+            return None  # singular even with the ridge term: skip the prediction rather than crash
         st['raw'] = self._cv_key @ M.T
         return st['raw']
 
