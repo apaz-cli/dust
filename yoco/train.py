@@ -220,6 +220,7 @@ def main():
     log = (args.output / 'metrics.jsonl').open('w')
     start = time.monotonic()
     ema = None
+    high = 0  # consecutive steps with training loss above 10
     base_lr = [g['lr'] for g in optimizer.param_groups]
     wema = {n: p_.detach().float().clone() for n, p_ in model.named_parameters()} if args.ema else None
 
@@ -282,7 +283,10 @@ def main():
             moe.balance(model)
         rec = dict(step=step, train_loss=loss, seconds=round(time.monotonic() - start, 1))
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
-        if not math.isfinite(loss) or loss > 10 or (step > 50 and ema > 9):
+        high = high + 1 if loss > 10 else 0
+        # diverged: a non-finite loss, the loss above 10 for 5 steps in a row (a single spike may recover), or the
+        # smoothed loss above 9 after step 50
+        if not math.isfinite(loss) or high >= 5 or (step > 50 and ema > 9):
             rec['diverged'] = True
             log.write(json.dumps(rec) + '\n')
             print(json.dumps(rec), flush=True)
