@@ -97,6 +97,7 @@ def main():
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
     p.add_argument('--freeze-attn', action='store_true', help='residual-stream draws hold later attention and the cache clean')
+    p.add_argument('--readout', action='store_true', help='cross-token readout: each draw also scores the closed-form change of later tokens\' attention outputs from its own keys and values (needs --chain --chain-own --chain-hubs-only)')
     p.add_argument('--cache-separate', action='store_true', help='leak-free scoring for the YOCO cache k/v too')
     p.add_argument('--local-separate', action='store_true', help='leak-free local k/v/gate/ve scoring (closed form)')
     p.add_argument('--oracle-re', help='regex on parameter names given their noise-free expected update')
@@ -187,6 +188,7 @@ def main():
         estimator.chain_pool = not args.chain_own
         estimator.chain_hidden = not args.chain_hubs_only
         estimator.chain = bool(args.chain)
+        estimator.readout = args.readout
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
         estimator.cache_gamma = args.cache_gamma

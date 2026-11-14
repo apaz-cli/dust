@@ -63,6 +63,9 @@ class DustX(DUST):
             assert m.hs, 'Dust MoE needs a shared expert: its c_proj output is the layer-output site'
             m.dust = (self, q)
         self.accum, self.accum_valid = None, 0  # gradient accumulation over microbatches (train.py --microbatch-size)
+        self.readout = False  # cross-token readout: reward each draw's token t also for later tokens' predicted loss change
+        self.readout_targets = None  # {layer: attention-output (o@) errors [b, t, n_embd]} the readout scores against
+        self._ro_names, self._ro_clean = set(), {}
         self.freeze_attn = False  # residual-stream draws: hold every later attention output (and the cache) clean
         self._frozen = set()
         self.cache_separate = False  # the same leak-free scoring for the YOCO cache k/v (all cross layers)
@@ -102,6 +105,7 @@ class DustX(DUST):
         self.x, self.y = x, y
         self.batch, self.length = x.shape
         self.capturing = True
+        self._ro_clean = {}
         self.state, self._reps, self._start = {}, {}, 0
         try:
             with self.autocast():
@@ -193,7 +197,7 @@ class DustX(DUST):
             out = base(module, args, output)
             if out is None:
                 out = output
-            if name in self._aug and not self.capturing:
+            if (name in self._aug or name in self._ro_names) and not self.capturing:
                 self._draw_outs[name] = out
             return out
         return hook
@@ -267,6 +271,86 @@ class DustX(DUST):
             return int(site.split('.')[2]) < self.res_blocks
         return False
 
+    def readout_layers(self, sites):
+        """Lower-half blocks whose keys and values a draw at these sites changes, and whether the cache changes."""
+        first = 0
+        if all(s.startswith('transformer.h.') for s in sites):
+            first = min(int(s.split('.')[2]) for s in sites) + 1  # a block's own K/V are computed before its sites
+        S = self.n_self if self.yoco else self.model.config.n_layer
+        return list(range(first, S)), self.yoco and first <= S
+
+    def readout_names(self, sites):
+        layers, cache = self.readout_layers(sites)
+        names = {f'transformer.h.{j}.attn.c_{w}' for j in layers for w in 'kv'}
+        return names | ({'transformer.cache_k', 'transformer.cache_v'} if cache else set())
+
+    def _readout_prep(self, j):
+        """Clean quantities for block j's attention (j = 'cache': every upper-half layer reading the cache)."""
+        if j in self._ro_clean:
+            return self._ro_clean[j]
+        cfg = self.model.config
+        b, t, h = self.batch, self.length, cfg.n_head
+        d = cfg.n_embd // h
+        pos = torch.arange(t, device=self.device)
+        lag = pos[:, None] - pos[None, :]  # [s (reader), t (key)]
+        out = []
+        if j == 'cache':
+            k_raw = self.outputs['transformer.cache_k'].float().view(b, t, h, d)
+            values = self.outputs['transformer.cache_v'].float().view(b, t, h, d)
+            readers = list(range(self.n_self, cfg.n_layer))
+        else:
+            p = f'transformer.h.{j}.attn.'
+            k_raw = self.outputs[p + 'c_k'].float().view(b, t, h, d)
+            values = self.outputs[p + 'c_v'].float().view(b, t, h, d)
+            if has_ve(j, cfg.n_layer) and f'value_embeds.{j}' in self.outputs:
+                z = self.outputs[p + 've_gate'].float()
+                values = values + (2 * torch.sigmoid(z)).unsqueeze(-1) * self.outputs[f'value_embeds.{j}'].float().view(b, t, h, d)
+            readers = [j]
+        kp = self._processed(k_raw, t).float()
+        for i in readers:
+            qp = self._processed(self.outputs[f'transformer.h.{i}.attn.c_q'].float().view(b, t, h, d), t).float()
+            window = self.model.window_sizes[i][0]
+            mask = (lag >= 0) & (lag <= window)
+            P = (torch.einsum('bshd,bthd->bhst', qp, kp) / d ** 0.5).masked_fill(~mask, float('-inf')).softmax(-1)
+            o = torch.einsum('bhst,bthd->bshd', P, values)
+            e = self.readout_targets[i].float().view(b, t, h, d)
+            ev = torch.einsum('bshd,bthd->bhst', e, values)
+            eo = torch.einsum('bshd,bshd->bhs', e, o)
+            later = (lag >= 1).float()  # other tokens only: token t's own loss is already in its reward
+            out.append((qp, P * later, e, ev - eo[..., None]))
+        self._ro_clean[j] = (kp, values, out)
+        return self._ro_clean[j]
+
+    def readout_loss(self, n):
+        """Predicted change of the other tokens' losses from each token's own key and value change in this draw.
+
+        For key t, the draw's change of its processed key moves one score per reader s, and its value change moves
+        one value; a softmax with one changed row has the closed form
+            o'_s - o_s = (r (v_t - o_s) + P_st e^delta dv_t) / (1 + r),  r = P_st (e^delta - 1), delta = q_s . dk_t / sqrt(d)
+        Scored against reader s's attention-output error e_s and summed over later readers s and all heads: [n, b, t].
+        """
+        cfg = self.model.config
+        b, t, h = self.batch, self.length, cfg.n_head
+        d = cfg.n_embd // h
+        tot = 0
+        layers, cache = self.readout_layers([k for k in self.jitter] or ['transformer.wte'])
+        for j in layers + (['cache'] if cache else []):
+            kname, vname = ('transformer.cache_k', 'transformer.cache_v') if j == 'cache' else \
+                (f'transformer.h.{j}.attn.c_k', f'transformer.h.{j}.attn.c_v')
+            if kname not in self._draw_outs:
+                continue
+            kp, values, readers = self._readout_prep(j)
+            k2 = self._draw_outs[kname].float().view(n * b, t, h, d)
+            dk = self._processed(k2, t).float().view(n, b, t, h, d) - kp.unsqueeze(0)
+            dv = self._draw_outs[vname].float().view(n, b, t, h, d) - self.outputs[vname].float().view(1, b, t, h, d)
+            for qp, P, e, ev in readers:
+                delta = torch.einsum('bshd,nbthd->nbhst', qp, dk) / d ** 0.5
+                ex = torch.exp(delta)
+                r = P * (ex - 1)
+                edv = torch.einsum('bshd,nbthd->nbhst', e, dv)
+                tot = tot + ((r * ev + P * ex * edv) / (1 + r)).sum((2, 3))
+        return tot
+
     def frozen_for(self, sites):
         """Attention outputs (and YOCO's cache) a draw at these sites should hold clean, for freeze_attn: every
         attention output from the first perturbed block on, except where the draw perturbs that attention itself."""
@@ -283,10 +367,13 @@ class DustX(DUST):
     def direct_errors(self, sites, draws, sigma):  # DUST.direct_errors plus optional residual credit
         """One-sided loss drops, centered across each chunk of draws. """
         self._frozen = self.frozen_for(sites) if self.freeze_attn and self.score is None else set()
+        self._ro_names = self.readout_names(sites) if self.readout and self.readout_targets is not None else set()
         try:
             return self._direct_errors(sites, draws, sigma)
         finally:
-            self._frozen = set()
+            self._frozen, self._ro_names = set(), set()
+            for k in [k for k in self._draw_outs if k not in self._aug]:
+                del self._draw_outs[k]
 
     def _direct_errors(self, sites, draws, sigma):
         self._start = self.start_for(sites) if self.score is None else 0
@@ -313,6 +400,8 @@ class DustX(DUST):
                 perturbed_loss = self.losses(x, y).view(n, self.batch, self.length)
                 if self._aug:
                     perturbed_loss = perturbed_loss + self.aug_loss(n)
+                if self._ro_names:
+                    perturbed_loss = perturbed_loss + self.readout_loss(n)
             finally:
                 self.jitter = {}
 
@@ -930,6 +1019,25 @@ class DustX(DUST):
             self._aug = self.aug_names(-1) if self.kv_credit_embedding else {}
             direct(['transformer.wte'], r.embedding, 0.2)
             self._aug, self._draw_outs = {}, {}
+            return self.finish(x, y, optimizer, errors)
+
+        if self.readout and self.chain and not self.chain_pool and self.chain_hidden is False and not self.handoff:
+            # Cross-token readout: blocks top-down, so every reader's attention-output target (chained from its
+            # block's own c_proj error) exists before a lower block's draws are scored against it.
+            targets = {}
+            self.readout_targets = targets
+            for layer in reversed(range(L)):
+                p = f'transformer.h.{layer}.'
+                direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[layer], 0.2)
+                direct([p + 'mlp.c_fc'], r.hidden[layer], 0.2)
+                targets[layer] = self.local_proj(layer, errors[p + 'attn.c_proj'], self.chain_draws)
+            direct(['transformer.wte'], r.embedding, 0.2)
+            self._halves, self.readout_targets = {}, None
+            if self.yoco:
+                for kind in ('q', 'k', 'v'):
+                    errors.update(self.zo_cross(kind, r.local[kind], targets))
+            for kind, count in r.local.items():
+                errors.update(self.zo_self_local(kind, count, targets))
             return self.finish(x, y, optimizer, errors)
 
         if self.chain and not self.handoff and not self.kv_credit:
