@@ -228,6 +228,10 @@ def main():
     if args.clip:
         # Wrap the optimizer's step so every path (Dust, microbatches, backprop) is clipped the same way. The limit is
         # CLIP times an average of recent (clipped) gradient norms; the first 20 steps only build the average.
+        # Why adaptive rather than the standard fixed max-norm: the size of Dust's gradient estimate varies a lot
+        # between recipes and model sizes, so a fixed threshold would need tuning per setup. A relative limit works
+        # unchanged everywhere (the idea is not new; AutoClip, Seetharaman et al. 2020, clips at a percentile of
+        # recent norms).
         raw_step = optimizer.step
 
         def clipped_step(*a, **kw):
