@@ -66,6 +66,11 @@ class DustX(DUST):
         self.readout = False  # cross-token readout: reward each draw's token t also for later tokens' predicted loss change
         self.readout_targets = None  # {layer: attention-output (o@) errors [b, t, n_embd]} the readout scores against
         self.readout_scale = 1.0  # weight of the readout term in each draw's reward
+        # 'credit': add to token t the predicted change of later tokens' losses from its own keys and values;
+        # 'leak': subtract from token s the predicted change of its own loss from earlier tokens' keys and values
+        # (the leakage into its reward; unbiased whatever the targets, since it depends only on other tokens'
+        # noise); 'both': the two together ("symmetric readout")
+        self.readout_mode = 'credit'
         self.readout_warmup, self._steps = 0, 0  # steps before the readout turns on (its targets start as noise)
         self._ro_names, self._ro_clean = set(), {}
         self.freeze_attn = False  # residual-stream draws: hold every later attention output (and the cache) clean
@@ -350,7 +355,11 @@ class DustX(DUST):
                 ex = torch.exp(delta)
                 r = P * (ex - 1)
                 edv = torch.einsum('bshd,nbthd->nbhst', e, dv)
-                tot = tot + ((r * ev + P * ex * edv) / (1 + r)).sum((2, 3))
+                X = (r * ev + P * ex * edv) / (1 + r)  # [n, b, h, s (reader), t (key)]
+                if self.readout_mode in ('credit', 'both'):
+                    tot = tot + X.sum((2, 3))
+                if self.readout_mode in ('leak', 'both'):
+                    tot = tot - X.sum((2, 4))
         return tot
 
     def frozen_for(self, sites):

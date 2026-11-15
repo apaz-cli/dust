@@ -13,7 +13,10 @@ With `quality`: how good the targets must be. Targets are the exact errors plus 
 cosine c with them (mode tc<c>), Dust hubs at more draws (mode hub<draws>, their cosine logged as
 hub<draws>/<i>/cos), and the chained targets training uses (mode chain: each block's c_proj error at the recipe's
 draws through 256 local probes, cosine logged as chain/<i>/cos); writer draws fixed at 256. Logged keys: <mode>/<site>/N256/<cos|relerr>.
-usage: bench_readout.py RUN DATA_DIR [R] [quality]
+With `sym`: the symmetric readout. Readout modes credit (as above), leak (subtract the predicted leakage of earlier
+tokens' keys and values into each token's own reward) and both, with exact and with the training's chained
+targets, at N = 64, 256, 1024. Logged keys: <mode>_<target>/<site>/N<draws>/<cos|relerr>, plus plain.
+usage: bench_readout.py RUN DATA_DIR [R] [quality|sym]
 """
 from pathlib import Path
 import sys
@@ -30,6 +33,7 @@ from mlsweep.logger import MLSweepLogger  # noqa: E402  (no-op outside an mlswee
 run, data_dir = sys.argv[1], sys.argv[2]
 R = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 quality = len(sys.argv) > 4 and sys.argv[4] == 'quality'
+sym = len(sys.argv) > 4 and sys.argv[4] == 'sym'
 torch.manual_seed(0)
 model = load(run)
 L = model.config.n_layer
@@ -64,8 +68,9 @@ with torch.no_grad():
         c = F.cosine_similarity(hubs[i].flatten(), exact[i].flatten(), 0).item()
         record[f'hub/{i}/cos'] = c
         print(f'o@{i} Dust hub vs exact own-token error: cos {c:.3f}', flush=True)
-    def score(mode, N, reps, targets):
+    def score(mode, N, reps, targets, ro_mode='credit'):
         est.readout = targets is not None
+        est.readout_mode = ro_mode
         est.readout_targets = targets
         est._ro_clean = {}
         acc = {s: [0.0, 0.0] for s in sites}
@@ -83,7 +88,23 @@ with torch.no_grad():
             record[f'{mode}/{site}/N{N}/relerr'] = e
             print(f'N={N:5d} {mode:8s} {site:22s} cos {c:6.3f}  rel err {e:9.3f}', flush=True)
 
-    if not quality:
+    def chained_targets():
+        est.readout = False
+        est.generator.manual_seed(9)
+        out = {}
+        for i in range(L):
+            w = est.direct_errors([f'transformer.h.{i}.attn.c_proj'], st.writers[i], 0.2)[f'transformer.h.{i}.attn.c_proj']
+            out[i] = est.local_proj(i, w, 256)
+        return out
+
+    if sym:
+        chain = chained_targets()
+        for N in (64, 256, 1024):
+            score('plain', N, R if N < 1024 else 1, None)
+            for tname, targets in (('exact', exact), ('chain', chain)):
+                for m in ('credit', 'leak', 'both'):
+                    score(f'{m}_{tname}', N, R if N < 1024 else 1, targets, m)
+    elif not quality:
         for N in (64, 256, 1024):
             for mode, targets in (('plain', None), ('exact', exact), ('dust', hubs)):
                 score(mode, N, R if N < 1024 else 1, targets)

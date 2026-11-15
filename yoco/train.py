@@ -99,6 +99,9 @@ def main():
     p.add_argument('--freeze-attn', action='store_true', help='residual-stream draws hold later attention and the cache clean')
     p.add_argument('--readout', action='store_true', help='cross-token readout: each draw also scores the closed-form change of later tokens\' attention outputs from its own keys and values (needs --chain --chain-own --chain-hubs-only)')
     p.add_argument('--readout-scale', type=float, default=1.0, help='weight of the readout term in each draw\'s reward')
+    p.add_argument('--readout-mode', choices=['credit', 'leak', 'both'], default='credit',
+                   help='readout: credit later tokens\' loss changes to t (credit), cancel the predicted leakage into each '
+                        'token\'s own reward (leak), or both (symmetric readout)')
     p.add_argument('--readout-warmup', type=int, default=0, help='steps of plain Dust before --readout turns on')
     p.add_argument('--cache-separate', action='store_true', help='leak-free scoring for the YOCO cache k/v too')
     p.add_argument('--local-separate', action='store_true', help='leak-free local k/v/gate/ve scoring (closed form)')
@@ -195,6 +198,7 @@ def main():
         estimator.readout = args.readout
         estimator.readout_warmup = args.readout_warmup
         estimator.readout_scale = args.readout_scale
+        estimator.readout_mode = args.readout_mode
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
         estimator.cache_gamma = args.cache_gamma
