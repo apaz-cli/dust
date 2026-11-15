@@ -26,9 +26,31 @@ from torch.nn import functional as F
 from model import apply_rotary_emb, norm
 
 
+# Noise simulator: modules mapped to a noise ratio rho. The error reaching such a module's output (each token's
+# gradient g_t) gets Gaussian noise of norm about rho * |g_t|, the size of Dust's per-token noise at that site.
+NOISE = {}
+
+
+class _NoisyGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, rho):
+        ctx.rho = rho
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        scale = g.float().norm(dim=-1, keepdim=True) / g.shape[-1] ** 0.5
+        return g + (ctx.rho * scale * torch.randn_like(g, dtype=torch.float32)).to(g.dtype), None
+
+
+def noisy(out, module):
+    rho = NOISE.get(module)
+    return out if rho is None else _NoisyGrad.apply(out, rho)
+
+
 def _split(lin, x):
     """Same value twice: the first carries gradient only to the weight, the second only to the input."""
-    return F.linear(x.detach(), lin.weight), F.linear(x, lin.weight.detach())
+    return noisy(F.linear(x.detach(), lin.weight), lin), F.linear(x, lin.weight.detach())
 
 
 def ed_attention(q, ks, vs, kw, vw, window, gamma, stream):

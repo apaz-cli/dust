@@ -96,6 +96,7 @@ def main():
     p.add_argument('--cv-warmup', type=int, default=20)
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
+    p.add_argument('--sim-noise', type=float, default=0.0, help='ed only: noise simulator, Dust-sized noise C d / N per site')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
     p.add_argument('--freeze-attn', action='store_true', help='residual-stream draws hold later attention and the cache clean')
     p.add_argument('--readout', action='store_true', help='cross-token readout: each draw also scores the closed-form change of later tokens\' attention outputs from its own keys and values (needs --chain --chain-own --chain-hubs-only)')
@@ -223,6 +224,33 @@ def main():
         model.requires_grad_(True)
         if args.method == 'ed':  # noise-free DUST: backprop of the expected DUST update
             expected.install(model, settings.gamma, cross_full=args.handoff)
+            if args.sim_noise:
+                # Noise simulator: Dust's per-token noise at each site, sized by its draw count. A Dust estimate from
+                # N draws of a d-wide site has noise of about sqrt(d / N) times the error (more with leakage, less
+                # with the control variate); --sim-noise C scales that as rho = sqrt(C d / N). Not added: the head,
+                # value embeddings and gates. A derivative-based measuring tool, not a method.
+                S_ = getattr(model, 'n_self', config.n_layer)
+                emb, loc = settings.embedding, settings.local  # already scaled by the --*-scale flags
+
+                def put(mod, draws):
+                    d_ = mod.weight.shape[0] if isinstance(mod, torch.nn.Linear) else mod.weight.shape[1]
+                    expected.NOISE[mod] = (args.sim_noise * d_ / max(draws, 1)) ** 0.5
+                for i, blk in enumerate(model.transformer.h):
+                    put(blk.attn.c_proj, settings.writers[i])
+                    put(blk.mlp.c_proj, settings.writers[i])
+                    put(blk.mlp.c_fc, settings.hidden[i])
+                    put(blk.attn.c_q, loc['q'])
+                    if i < S_:
+                        put(blk.attn.c_k, loc['k'])
+                        put(blk.attn.c_v, loc['v'])
+                put(model.transformer.wte, emb)
+                if hasattr(model.transformer, 'cache_k'):
+                    put(model.transformer.cache_k, loc['k'])
+                    put(model.transformer.cache_v, loc['v'])
+                for mod in list(expected.NOISE):
+                    if mod not in (getattr(model.transformer, 'cache_k', None), getattr(model.transformer, 'cache_v', None)) \
+                            and not any(mod is blk.attn.c_k or mod is blk.attn.c_v for blk in model.transformer.h):
+                        mod.register_forward_hook(lambda m, a, out: expected.noisy(out, m))
             if args.ed_own_layers is not None:
                 for i, blk in enumerate(model.transformer.h):
                     blk.attn.ed_stream = 'own' if i in args.ed_own_layers else 'full'
