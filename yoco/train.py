@@ -97,6 +97,7 @@ def main():
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
     p.add_argument('--sim-noise', type=float, default=0.0, help='ed only: noise simulator, Dust-sized noise C d / N per site')
+    p.add_argument('--sim-cv', help='noise simulator: JSON of control-variate shares per site (cv_explained of a recipe run)')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
     p.add_argument('--freeze-attn', action='store_true', help='residual-stream draws hold later attention and the cache clean')
     p.add_argument('--readout', action='store_true', help='cross-token readout: each draw also scores the closed-form change of later tokens\' attention outputs from its own keys and values (needs --chain --chain-own --chain-hubs-only)')
@@ -232,18 +233,22 @@ def main():
                 S_ = getattr(model, 'n_self', config.n_layer)
                 emb, loc = settings.embedding, settings.local  # already scaled by the --*-scale flags
 
-                def put(mod, draws):
+                r2 = json.loads(Path(args.sim_cv).read_text()) if args.sim_cv else {}
+
+                def put(mod, draws, key=None):
+                    # key: the site whose control-variate share (1 - its variance left) applies, from a recipe run
                     d_ = mod.weight.shape[0] if isinstance(mod, torch.nn.Linear) else mod.weight.shape[1]
-                    expected.NOISE[mod] = (args.sim_noise * d_ / max(draws, 1)) ** 0.5
+                    left = 1 - r2.get(key, 0.0) if key else 1.0
+                    expected.NOISE[mod] = (args.sim_noise * d_ * left / max(draws, 1)) ** 0.5
                 for i, blk in enumerate(model.transformer.h):
-                    put(blk.attn.c_proj, settings.writers[i])
-                    put(blk.mlp.c_proj, settings.writers[i])
-                    put(blk.mlp.c_fc, settings.hidden[i])
+                    put(blk.attn.c_proj, settings.writers[i], f'transformer.h.{i}.attn.c_proj')
+                    put(blk.mlp.c_proj, settings.writers[i], f'transformer.h.{i}.attn.c_proj')
+                    put(blk.mlp.c_fc, settings.hidden[i], f'transformer.h.{i}.mlp.c_fc')
                     put(blk.attn.c_q, loc['q'])
                     if i < S_:
                         put(blk.attn.c_k, loc['k'])
                         put(blk.attn.c_v, loc['v'])
-                put(model.transformer.wte, emb)
+                put(model.transformer.wte, emb, 'transformer.wte')
                 if hasattr(model.transformer, 'cache_k'):
                     put(model.transformer.cache_k, loc['k'])
                     put(model.transformer.cache_v, loc['v'])
@@ -251,7 +256,7 @@ def main():
                          for n in ('cache_k', 'cache_v', 'c_k', 'c_v') if hasattr(o, n)}  # noised inside _split
                 for mod in list(expected.NOISE):
                     if id(mod) not in split_ids:
-                        mod.register_forward_hook(lambda m, a, out: expected.noisy(out, m))
+                        mod.register_forward_hook(expected.noisy_hook)
             if args.ed_own_layers is not None:
                 for i, blk in enumerate(model.transformer.h):
                     blk.attn.ed_stream = 'own' if i in args.ed_own_layers else 'full'

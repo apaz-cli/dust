@@ -48,6 +48,16 @@ def noisy(out, module):
     return out if rho is None else _NoisyGrad.apply(out, rho)
 
 
+def noisy_hook(module, args, out):
+    """Forward hook: the noise reaches only this module's weight, as each Dust site's estimate is separate; the
+    error passed on to the layers below stays clean."""
+    if isinstance(module, torch.nn.Embedding):
+        return noisy(out, module)
+    x = args[0]
+    ow = noisy(F.linear(x.detach(), module.weight), module)
+    return F.linear(x, module.weight.detach()) + (ow - ow.detach())
+
+
 def _split(lin, x):
     """Same value twice: the first carries gradient only to the weight, the second only to the input."""
     return noisy(F.linear(x.detach(), lin.weight), lin), F.linear(x, lin.weight.detach())
