@@ -10,12 +10,18 @@ from _common import LEAKFREE, PY, TINYSTORIES, UPLOAD_EXCLUDE  # noqa: F401
 
 COMMAND = [PY, "yoco/train.py", "--arch", "yoco", "--seed", "42", "--data-dir", TINYSTORIES, "--steps", "1500",
            "--local-scale", "1"] + LEAKFREE
-OPTIONS = {".arm": {"values": ["cv_only_adamw", "live_only_adamw"],
+OPTIONS = {".arm": {"values": ["cv_only_adamw", "live_only_adamw", "cv_only_sgd", "live_only_sgd"],
                     "flags": {"nocv_adamw": ["--opt", "adamw", "--adam-lr", "3e-3"],
                               "nocv_sgd": [],
                               "cv_beta05_adamw": ["--live-fc", "--cv", "--cv-beta", "0.5", "--opt", "adamw",
                                                   "--adam-lr", "3e-3"],
                               "cv_only_adamw": ["--cv", "--opt", "adamw", "--adam-lr", "3e-3"],
-                              "live_only_adamw": ["--live-fc", "--opt", "adamw", "--adam-lr", "3e-3"]}}}
+                              "live_only_adamw": ["--live-fc", "--opt", "adamw", "--adam-lr", "3e-3"],
+                              "cv_only_sgd": ["--cv"],
+                              "live_only_sgd": ["--live-fc"]}}}
 METRIC = "val_loss"
 GOAL = "minimize"
+
+
+def EXCLUDE(combo):  # the AdamW arms ran in adam_dust_cause2_20261115_0452_0738
+    return combo["arm"].endswith("adamw")
