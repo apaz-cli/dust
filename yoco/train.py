@@ -127,6 +127,8 @@ def main():
     p.add_argument('--sim-tail', help='noise simulator: heavy tails at the same variance, "DF,elem" or "DF,token"')
     p.add_argument('--sim-floor', type=float, default=0.0, help='noise simulator: noise floor, a share of the mean per-token error')
     p.add_argument('--sim-cv', help='noise simulator: JSON of control-variate shares per site (cv_explained of a recipe run)')
+    p.add_argument('--init', help='checkpoint folder to start from (its step3000.pt)')
+    p.add_argument('--halves-every', action='store_true', help='copy task: log both halves\' loss at every evaluation')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
     p.add_argument('--freeze-attn', action='store_true', help='residual-stream draws hold later attention and the cache clean')
     p.add_argument('--readout', action='store_true', help='cross-token readout: each draw also scores the closed-form change of later tokens\' attention outputs from its own keys and values (needs --chain --chain-own --chain-hubs-only)')
@@ -195,6 +197,8 @@ def main():
     train = train[order]
 
     model = build(args.arch, config, device, args.seed, n_self=args.n_self)
+    if args.init:  # start from a trained checkpoint (e.g. a backprop model, to see what Dust training does to it)
+        model.load_state_dict(torch.load(Path(args.init) / 'step3000.pt', map_location=device, weights_only=True))
     if args.moe:
         from yoco import moe
         E, k, h, hs = (int(v) for v in args.moe.split(','))
@@ -421,6 +425,8 @@ def main():
                     wema[n].lerp_(p_.detach().float(), 1 - args.ema)
         if step == 1 or step % args.eval_every == 0 or step == args.steps:
             rec['val_loss'] = evaluate(model, val)
+            if args.halves_every and 'tsrepeat' in str(args.data_dir):
+                rec['val_first_half'], rec['val_second_half'] = halves(model, val)
             if args.moe:
                 rec['moe_load'] = moe_load
             if estimator is not None and estimator.cv_stats:
@@ -459,6 +465,7 @@ def scalars(rec):
     return out
 
 
+@torch.no_grad()
 @torch.no_grad()
 def halves(model, rows, n=64):
     """TinyStories-repeat: mean loss on the first half of each row (plain LM) and the copyable second half."""
