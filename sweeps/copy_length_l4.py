@@ -2,7 +2,7 @@
 # is headline_copy_l4). Tokens per step held at 4096 where possible (8 x 512, 2 x 2048); T = 8192 is 1 sequence,
 # so 8192 tokens per step. Backprop and noise-free Dust as references, the recipe (leak-free scoring, live units,
 # control variate) with the long credit horizon, and the recipe plus the cross-token readout at T = 2048.
-# 4 layers, 3000 steps, seed 42. Data: yoco/make_repeat_long.py.
+# 4 layers, 3000 steps. copy_length_seeds_l4: the same at seeds 7 and 1. Data: yoco/make_repeat_long.py.
 from _common import LEAKFREE_CV, PY, UPLOAD_EXCLUDE  # noqa: F401
 
 LONG = ["--gamma", "1", "--cache-gamma", "0.98", "--local-scale", "1"]
