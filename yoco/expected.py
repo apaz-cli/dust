@@ -29,6 +29,20 @@ from model import apply_rotary_emb, norm
 # Noise simulator: modules mapped to a noise ratio rho. The error reaching such a module's output (each token's
 # gradient g_t) gets Gaussian noise of norm about rho * |g_t|, the size of Dust's per-token noise at that site.
 NOISE = {}
+# Heavy tails at the same variance: TAIL = (df, 'elem' | 'token'); Student-t noise per number, or Gaussian noise
+# scaled per token by a Student-t factor (a whole token's reward unusually large). None: Gaussian.
+TAIL = None
+
+
+def _noise_like(g):
+    z = torch.randn_like(g, dtype=torch.float32)
+    if TAIL is None:
+        return z
+    df, mode = TAIL
+    shape = g.shape if mode == 'elem' else g.shape[:-1] + (1,)
+    chi = torch.distributions.Chi2(torch.tensor(float(df), device=g.device)).sample(shape)
+    w = (df / chi).sqrt() * ((df - 2) / df) ** 0.5  # Student-t / its std, so the variance stays the same
+    return z * w
 
 
 class _NoisyGrad(torch.autograd.Function):
@@ -40,7 +54,7 @@ class _NoisyGrad(torch.autograd.Function):
     @staticmethod
     def backward(ctx, g):
         scale = g.float().norm(dim=-1, keepdim=True) / g.shape[-1] ** 0.5
-        return g + (ctx.rho * scale * torch.randn_like(g, dtype=torch.float32)).to(g.dtype), None
+        return g + (ctx.rho * scale * _noise_like(g)).to(g.dtype), None
 
 
 def noisy(out, module):
