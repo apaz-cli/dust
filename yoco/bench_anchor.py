@@ -76,7 +76,7 @@ def anchored(k, e):
             est.model(xr, None, start=est._start, state=est.rep_state(n), record=rec)
         dx = rec['x'][k].float().view(n, est.batch, est.length, -1) - est.state['x'][k].float().unsqueeze(0)
         lin = torch.einsum('nbtd,btd->nbt', dx, e)
-        return (est.clean_loss.unsqueeze(0) + lin).view(n * est.batch, est.length)
+        return (est.clean_loss.unsqueeze(0) + lin).reshape(n * est.batch, est.length)
     return losses
 
 
