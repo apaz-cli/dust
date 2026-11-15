@@ -97,6 +97,7 @@ def main():
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
     p.add_argument('--sim-noise', type=float, default=0.0, help='ed only: noise simulator, Dust-sized noise C d / N per site')
+    p.add_argument('--sim-kv-head', action='store_true', help='noise simulator: size key/value noise by the head width')
     p.add_argument('--sim-cv', help='noise simulator: JSON of control-variate shares per site (cv_explained of a recipe run)')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
     p.add_argument('--freeze-attn', action='store_true', help='residual-stream draws hold later attention and the cache clean')
@@ -235,9 +236,10 @@ def main():
 
                 r2 = json.loads(Path(args.sim_cv).read_text()) if args.sim_cv else {}
 
-                def put(mod, draws, key=None):
+                def put(mod, draws, key=None, d_=None):
                     # key: the site whose control-variate share (1 - its variance left) applies, from a recipe run
-                    d_ = mod.weight.shape[0] if isinstance(mod, torch.nn.Linear) else mod.weight.shape[1]
+                    if d_ is None:
+                        d_ = mod.weight.shape[0] if isinstance(mod, torch.nn.Linear) else mod.weight.shape[1]
                     left = 1 - r2.get(key, 0.0) if key else 1.0
                     expected.NOISE[mod] = (args.sim_noise * d_ * left / max(draws, 1)) ** 0.5
                 for i, blk in enumerate(model.transformer.h):
@@ -245,13 +247,14 @@ def main():
                     put(blk.mlp.c_proj, settings.writers[i], f'transformer.h.{i}.attn.c_proj')
                     put(blk.mlp.c_fc, settings.hidden[i], f'transformer.h.{i}.mlp.c_fc')
                     put(blk.attn.c_q, loc['q'])
+                    kv_d = config.n_embd // config.n_head if args.sim_kv_head else None  # leak-free: per key, per head
                     if i < S_:
-                        put(blk.attn.c_k, loc['k'])
-                        put(blk.attn.c_v, loc['v'])
+                        put(blk.attn.c_k, loc['k'], d_=kv_d)
+                        put(blk.attn.c_v, loc['v'], d_=kv_d)
                 put(model.transformer.wte, emb, 'transformer.wte')
                 if hasattr(model.transformer, 'cache_k'):
-                    put(model.transformer.cache_k, loc['k'])
-                    put(model.transformer.cache_v, loc['v'])
+                    put(model.transformer.cache_k, loc['k'], d_=kv_d)
+                    put(model.transformer.cache_v, loc['v'], d_=kv_d)
                 split_ids = {id(getattr(o, n)) for o in [model.transformer] + [b.attn for b in model.transformer.h]
                          for n in ('cache_k', 'cache_v', 'c_k', 'c_v') if hasattr(o, n)}  # noised inside _split
                 for mod in list(expected.NOISE):
