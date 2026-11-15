@@ -8,7 +8,11 @@ COMMAND = [PY, "yoco/train.py", "--arch", "yoco", "--seed", "42", "--data-dir", 
            "--local-scale", "1", "--opt", "adam_tensor"] + LEAKFREE_CV
 OPTIONS = {
     ".mlp": {"values": ["dense", "moe"], "flags": {"dense": [], "moe": ["--moe", "8,2,384,256"]}},
-    ".lr": {"values": [1e-3, 3e-3, 1e-2], "flags": "--adam-lr"},
+    ".lr": {"values": [1e-4, 3e-4, 1e-3, 3e-3, 1e-2], "flags": "--adam-lr"},
 }
 METRIC = "val_loss"
 GOAL = "minimize"
+
+
+def EXCLUDE(combo):  # 1e-3 and up ran in adam_tensor_20261115_0527_7532
+    return combo["lr"] >= 1e-3
