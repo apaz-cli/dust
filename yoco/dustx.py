@@ -53,6 +53,11 @@ class DustX(DUST):
         self.cv = False              # control variate: per-site ridge memory keyed on the finite-difference head error
         self.cv_beta, self.cv_warmup = 0.9, 20
         self._cv, self._cv_P, self._cv_key, self._cv_steps = {}, None, None, 0
+        # neighbor control variate: each site's prediction also uses a nearby site's error estimate from this step,
+        # made from separate draws before this site's (the next block's attention output for the writers, the
+        # block's MLP output for its MLP input, block 0's attention output for the embedding). A prediction fixed
+        # before the draws keeps the estimate unbiased; the ridge fit and trust scale decide how much it is used.
+        self.cv_neighbor, self._cv_extra = False, {}
         self.cv_stats = {}           # site -> [sum raw reward^2, sum corrected reward^2] since last read
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
@@ -156,12 +161,26 @@ class DustX(DUST):
         err = (change(1) - change(-1)) / (2 * h) * (self.y != -1).unsqueeze(-1)
         return err @ self.model.lm_head.weight[:V].float()
 
+    def _site_key(self, site):
+        """The head-error key, joined by the neighbor's error (scaled to the key's size) when there is one."""
+        e = self._cv_extra.get(site)
+        if e is None:
+            return self._cv_key, None
+        k = self._cv_key
+        e = e.float() * (k.square().mean().sqrt() / (e.float().square().mean().sqrt() + 1e-30))
+        kk = torch.cat([k, e], -1)
+        kf = kk.reshape(-1, kk.shape[-1])
+        return kk, kf.T @ kf / kf.shape[0]
+
     def cv_predict(self, site):
         """Ridge retrieval M k for every token, from earlier steps' estimates; None before any are stored."""
         st = self._cv.get(site)
         if st is None:
             return None
-        P = self._cv_P
+        key, Pstep = self._site_key(site)
+        if Pstep is not None and st['S'].shape[1] != key.shape[-1]:
+            return None
+        P = self._cv_P if Pstep is None else st.get('P', Pstep)
         if not (torch.isfinite(P).all() and torch.isfinite(st['S']).all()):
             return None  # a non-finite memory (after a bad step): no prediction this step, the draws do it all
         reg = (0.1 * P.diagonal().mean() + 1e-12) * torch.eye(P.shape[0], device=P.device)
@@ -169,15 +188,22 @@ class DustX(DUST):
             M = torch.linalg.solve(P + reg, st['S'].T).T
         except torch.linalg.LinAlgError:
             return None  # singular even with the ridge term: skip the prediction rather than crash
-        st['raw'] = self._cv_key @ M.T
+        st['raw'] = key @ M.T
         return st['raw']
 
     def cv_update(self, site, g):
         """Store this step's (unbiased) estimate in the memory, and refit the trust scale out of sample."""
-        k = self._cv_key.reshape(-1, self._cv_key.shape[-1])
+        key, Pstep = self._site_key(site)
+        k = key.reshape(-1, key.shape[-1])
         gf = g.reshape(-1, g.shape[-1])
         b = self.cv_beta
         st = self._cv.setdefault(site, dict(S=torch.zeros(gf.shape[1], k.shape[1], device=g.device), num=0., den=0.))
+        if st['S'].shape[1] != k.shape[1]:  # the key changed width (a neighbor appeared): start this memory over
+            st.update(S=torch.zeros(gf.shape[1], k.shape[1], device=g.device), num=0., den=0.)
+            st.pop('P', None)
+            st.pop('raw', None)
+        if Pstep is not None:
+            st['P'] = Pstep if 'P' not in st else b * st['P'] + (1 - b) * Pstep
         if 'raw' in st:
             raw = st.pop('raw').reshape(-1, gf.shape[1])
             st['num'] = b * st['num'] + (1 - b) * (gf * raw).sum().item()
@@ -1075,11 +1101,18 @@ class DustX(DUST):
             # and attention-output errors come from cheap local probes scored against the pooled stream errors.
             A = self.anchor if self.anchor and self._steps > self.anchor_warmup and not self.chain_hidden \
                 and not self.chain_pool else 0
-            for layer in range(A, L):
+            nb = self.cv and self.cv_neighbor
+            for layer in (reversed(range(A, L)) if nb else range(A, L)):  # top-down: the neighbors come first
                 p = f'transformer.h.{layer}.'
+                if nb:
+                    up = errors.get(f'transformer.h.{layer + 1}.attn.c_proj')
+                    self._cv_extra = {p + 'attn.c_proj': up, p + 'mlp.c_proj': up} if up is not None else {}
                 direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[layer], 0.2)
                 if not self.chain_hidden:
+                    if nb:
+                        self._cv_extra = {p + 'mlp.c_fc': errors[p + 'mlp.c_proj']}
                     direct([p + 'mlp.c_fc'], r.hidden[layer], 0.2)
+            self._cv_extra = {}
             if A:
                 # block A-1's writers by full draws give the anchor error; everything below reruns only to block A
                 p = f'transformer.h.{A - 1}.'
@@ -1095,7 +1128,10 @@ class DustX(DUST):
                 finally:
                     self._anchor_err = None
             # the embedding also reaches every block directly (x0_lambdas), past any anchor: full draws
+            if nb:
+                self._cv_extra = {'transformer.wte': errors['transformer.h.0.attn.c_proj']}
             direct(['transformer.wte'], r.embedding, 0.2)
+            self._cv_extra = {}
             if self.chain_pool:
                 errors = self.pool_writers(errors)
             self._halves = {}

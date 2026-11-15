@@ -92,6 +92,7 @@ def main():
     p.add_argument('--live-fc', action='store_true', help='MLP hidden draws jitter only live units (noise PR #5)')
     p.add_argument('--cv', action='store_true', help='control variate from a head-error-keyed credit memory (PR #6)')
     p.add_argument('--cv-beta', type=float, default=0.9)
+    p.add_argument('--cv-neighbor', action='store_true', help='control variate also keyed on a nearby site\'s error from this step (unbiased)')
     p.add_argument('--cv-warmup', type=int, default=20)
     p.add_argument('--hub-scale', type=int, default=1, help='multiply the o@ (attention output) draw counts')
     p.add_argument('--ed-own-layers', type=int, nargs='*', help='ed: only these layers keep own-token streams')
@@ -206,6 +207,7 @@ def main():
         estimator.readout_scale = args.readout_scale
         estimator.readout_mode = args.readout_mode
         estimator.anchor, estimator.anchor_scale = args.anchor, args.anchor_scale
+        estimator.cv_neighbor = args.cv_neighbor
         estimator.anchor_boost, estimator.anchor_warmup = args.anchor_boost, args.anchor_warmup
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
