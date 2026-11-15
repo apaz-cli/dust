@@ -127,7 +127,11 @@ def main():
     device = torch.device('cuda')
     torch.set_float32_matmul_precision('high')
     heads = args.n_embd // 64
-    config = GPTConfig(sequence_len=512, n_layer=args.n_layer, n_head=heads, n_kv_head=heads, n_embd=args.n_embd)
+    train = torch.load(args.data_dir / 'train.pt', weights_only=True).long()
+    val = torch.load(args.data_dir / 'validation.pt', weights_only=True).long().to(device)
+    # the sequence length (and with it the short attention window, half of it) follows the data's rows
+    config = GPTConfig(sequence_len=train.shape[1] - 1, n_layer=args.n_layer, n_head=heads, n_kv_head=heads,
+                       n_embd=args.n_embd)
     settings = recipe('10M', args.population)
     n = config.n_layer
     fit = lambda xs: (xs + [xs[-1]] * n)[:n]  # deeper than the recipe's 8 layers: repeat the last (deepest) count
@@ -145,8 +149,6 @@ def main():
         nrep = settings.nrep
         flat = lambda xs: [max(nrep, round(sum(xs) / len(xs) / nrep) * nrep)] * len(xs)
         settings = replace(settings, writers=flat(settings.writers), hidden=flat(settings.hidden))
-    train = torch.load(args.data_dir / 'train.pt', weights_only=True).long()
-    val = torch.load(args.data_dir / 'validation.pt', weights_only=True).long().to(device)
     order = torch.randperm(len(train), generator=torch.Generator().manual_seed(args.seed + 1))
     train = train[order]
 
@@ -380,7 +382,8 @@ def halves(model, rows, n=64):
         with torch.autocast('cuda', dtype=torch.bfloat16):
             L.append(model(x, y, loss_reduction='none').float().view(len(batch), -1))
     L = torch.cat(L)
-    return L[:, :255].mean().item(), L[:, 256:].mean().item()
+    h = L.shape[1] // 2
+    return L[:, :h - 1].mean().item(), L[:, h:].mean().item()
 
 
 if __name__ == '__main__':
