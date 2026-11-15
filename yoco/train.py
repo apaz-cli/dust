@@ -444,7 +444,7 @@ def main():
         logger.log(scalars(rec), step=step)
     if args.steps not in args.save_at:
         save(args.steps)
-    if 'tsrepeat' in str(args.data_dir) and not rec.get('diverged'):
+    if 'tsrepeat' in str(args.data_dir) and not rec.get('diverged') and not (args.halves_every and 'val_second_half' in rec):
         first, second = halves(model, val)
         logger.log({'val_first_half': first, 'val_second_half': second}, step=rec['step'])
         print(json.dumps(dict(val_first_half=first, val_second_half=second)), flush=True)
