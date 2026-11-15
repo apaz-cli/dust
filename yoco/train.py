@@ -106,6 +106,8 @@ def main():
                    help='anchored draws: sites below this self-decoder block rerun only up to it, scored against the '
                         'error there (needs --chain without pooling)')
     p.add_argument('--anchor-scale', type=int, default=1, help='multiply the anchored sites\' draws')
+    p.add_argument('--anchor-boost', type=int, default=1, help='multiply the draws of the writers that give the anchor error')
+    p.add_argument('--anchor-warmup', type=int, default=0, help='steps of ordinary draws before anchoring')
     p.add_argument('--readout-warmup', type=int, default=0, help='steps of plain Dust before --readout turns on')
     p.add_argument('--cache-separate', action='store_true', help='leak-free scoring for the YOCO cache k/v too')
     p.add_argument('--local-separate', action='store_true', help='leak-free local k/v/gate/ve scoring (closed form)')
@@ -204,6 +206,7 @@ def main():
         estimator.readout_scale = args.readout_scale
         estimator.readout_mode = args.readout_mode
         estimator.anchor, estimator.anchor_scale = args.anchor, args.anchor_scale
+        estimator.anchor_boost, estimator.anchor_warmup = args.anchor_boost, args.anchor_warmup
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
         estimator.cache_gamma = args.cache_gamma

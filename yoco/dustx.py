@@ -75,6 +75,9 @@ class DustX(DUST):
         # anchored draws: sites below self-decoder block `anchor` rerun only up to it and score the change of the
         # stream entering it against the error estimated there (block anchor-1's mlp.c_proj error)
         self.anchor, self.anchor_scale, self._anchor_err = 0, 1, None
+        # the anchor's error is shared by every draw below it, so its noise does not average over their draws:
+        # give block anchor-1's writers more draws (boost), and start anchoring only after a warm-up
+        self.anchor_boost, self.anchor_warmup = 1, 0
         self.readout_warmup, self._steps = 0, 0  # steps before the readout turns on (its targets start as noise)
         self._ro_names, self._ro_clean = set(), {}
         self.freeze_attn = False  # residual-stream draws: hold every later attention output (and the cache) clean
@@ -1070,7 +1073,8 @@ class DustX(DUST):
         if self.chain and not self.handoff and not self.kv_credit:
             # Full forwards only at residual-stream sites (writers, embedding), pooled across depths; MLP-hidden
             # and attention-output errors come from cheap local probes scored against the pooled stream errors.
-            A = self.anchor if self.anchor and not self.chain_hidden and not self.chain_pool else 0
+            A = self.anchor if self.anchor and self._steps > self.anchor_warmup and not self.chain_hidden \
+                and not self.chain_pool else 0
             for layer in range(A, L):
                 p = f'transformer.h.{layer}.'
                 direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[layer], 0.2)
@@ -1079,7 +1083,7 @@ class DustX(DUST):
             if A:
                 # block A-1's writers by full draws give the anchor error; everything below reruns only to block A
                 p = f'transformer.h.{A - 1}.'
-                direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[A - 1], 0.2)
+                direct([p + 'attn.c_proj', p + 'mlp.c_proj'], self.anchor_boost * r.writers[A - 1], 0.2)
                 self._anchor_err = errors[p + 'mlp.c_proj'].float()
                 k = self.anchor_scale
                 try:

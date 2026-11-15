@@ -6,8 +6,11 @@ the error's energy in the r-dimensional subspace. The subspace has to be found i
 batches and its share f measured on others.
 The errors are true gradients at each site's output (autograd, a measuring stick only), on a backprop-trained model.
 For each site: the top-r principal directions of the errors over the first half of the batches (uncentered), and
-the share of the held-out errors' energy they capture, at r = 1, 4, 16, 64, 256; and the gain f * d / r.
-Logged keys: <site>/r<r>/share, <site>/r<r>/gain, <site>/d.
+the share of the held-out errors' energy they capture, at r = 1, 4, 16, 64, 256; and the gain f * d / r. The bias of
+perturbing only inside the subspace is about the weight gradient, not the per-token errors: also logged is the share
+of each held-out batch's weight gradient (output side; for the embedding, the rows' feature side) inside the
+subspace, averaged over the held-out batches.
+Logged keys: <site>/r<r>/share, <site>/r<r>/gain, <site>/r<r>/wshare, <site>/d.
 usage: bench_spectrum.py RUN DATA_DIR [BATCHES]
 """
 from pathlib import Path
@@ -46,6 +49,7 @@ hooks = [m.register_forward_hook(hook(n)) for n, m in mods.items()]
 model.requires_grad_(True)
 fit = {n: None for n in mods}   # uncentered second moments, first half of the batches
 held = {n: [] for n in mods}    # held-out errors
+wgrads = {n: [] for n in mods}  # held-out weight gradients, [out, in] (embedding: [vocab, d] -> its d side)
 for bi in range(B):
     rows = data[8 * bi:8 * (bi + 1)]
     x, y = (rows[:, :-1] % 8192).contiguous(), rows[:, 1:].contiguous()
@@ -59,6 +63,8 @@ for bi in range(B):
             fit[n] = C if fit[n] is None else fit[n] + C
         else:
             held[n].append(g)
+            w = mods[n].weight.grad.float()
+            wgrads[n].append(w.clone() if n != 'wte' else w.T.clone())  # [site width, other]
     model.zero_grad(set_to_none=True)
 for h in hooks:
     h.remove()
@@ -78,7 +84,10 @@ for n in mods:
         share = (G @ vecs[:, :r]).square().sum().item() / total
         record[f'{n}/r{r}/share'] = share
         record[f'{n}/r{r}/gain'] = share * d / r
-        line.append(f'r{r} {share:.3f} (x{share * d / r:.1f})')
+        U = vecs[:, :r]
+        ws = sum((U.T @ W).square().sum().item() / W.square().sum().item() for W in wgrads[n]) / len(wgrads[n])
+        record[f'{n}/r{r}/wshare'] = ws
+        line.append(f'r{r} {share:.3f} (x{share * d / r:.1f}, w {ws:.3f})')
     print(f'{n:16s} d={d:5d}  ' + '  '.join(line), flush=True)
 with MLSweepLogger() as logger:
     logger.log(record, step=1)
