@@ -247,10 +247,10 @@ def main():
                 if hasattr(model.transformer, 'cache_k'):
                     put(model.transformer.cache_k, loc['k'])
                     put(model.transformer.cache_v, loc['v'])
-                split = {id(getattr(o, n)) for o in [model.transformer] + [b.attn for b in model.transformer.h]
+                split_ids = {id(getattr(o, n)) for o in [model.transformer] + [b.attn for b in model.transformer.h]
                          for n in ('cache_k', 'cache_v', 'c_k', 'c_v') if hasattr(o, n)}  # noised inside _split
                 for mod in list(expected.NOISE):
-                    if id(mod) not in split:
+                    if id(mod) not in split_ids:
                         mod.register_forward_hook(lambda m, a, out: expected.noisy(out, m))
             if args.ed_own_layers is not None:
                 for i, blk in enumerate(model.transformer.h):
