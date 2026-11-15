@@ -2,7 +2,7 @@
 # step (2 active experts per token): 8 experts at 64 sequences, 16 at 128, 32 at 256. Experts of 384 hidden units plus a
 # shared expert of 256, so active size is fixed and total size grows. Dense at the same batch sizes as the reference.
 # Real Dust (the recipe, SGD, microbatches of 8) and backprop (SGD, AdamW). 4 layers, 1500 steps, TinyStories (72k
-# rows; 256 x 1500 sequences is about 5 passes), seed 42.
+# rows; 256 x 1500 sequences is about 5 passes over it), seed 42.
 from _common import LEAKFREE_CV, PY, UPLOAD_EXCLUDE  # noqa: F401
 
 COMMAND = [PY, "yoco/train.py", "--arch", "yoco", "--seed", "42", "--data-dir", "data/tinystories_long", "--steps", "1500"]

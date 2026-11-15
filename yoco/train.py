@@ -373,7 +373,11 @@ def main():
                                          hidden=[r_(v) for v in settings.hidden], hubs=[r_(v) for v in settings.hubs],
                                          embedding=r_(settings.embedding),
                                          local={kk: r_(v) for kk, v in settings.local.items()})
-        batch = train[(step - 1) * args.batch_seqs:step * args.batch_seqs].to(device)
+        start_ = (step - 1) * args.batch_seqs % len(train)  # wrap around: another pass over the data
+        batch = train[start_:start_ + args.batch_seqs]
+        if len(batch) < args.batch_seqs:
+            batch = torch.cat([batch, train[:args.batch_seqs - len(batch)]])
+        batch = batch.to(device)
         x, y = split(batch)
         if estimator is not None:
             try:
