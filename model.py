@@ -12,6 +12,8 @@ def attention(q, k, v, window):
     A query at position s sees keys at s - window to s.
     """
     length = q.shape[1]
+    if q.shape[0] > 16:  # large batches: SDPA with a mask returned None on the B300s; run it in chunks
+        return torch.cat([attention(*t, window) for t in zip(q.split(16), k.split(16), v.split(16))])
     if window >= length - 1:  # plain causal: lets SDPA pick the flash kernel
         out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         return out.transpose(1, 2)
