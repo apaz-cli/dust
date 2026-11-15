@@ -13,6 +13,7 @@ Options (all default to stock DUST behaviour where it applies):
 In the YOCO cross-decoder, every site (writers, c_fc, o@, queries) is position-local given a clean cache,
 so plain DUST there is unbiased with zero leakage.
 """
+import os
 import re
 
 import torch
@@ -288,6 +289,10 @@ class DustX(DUST):
             return int(site.split('.')[2]) < self.res_blocks
         return False
 
+    def _has_ve(self, i):
+        # from the model itself: the YOCO self-decoder keeps value embeddings by the full model's layout
+        return f'value_embeds.{i}' in self.outputs and f'transformer.h.{i}.attn.ve_gate' in self.outputs
+
     def readout_layers(self, sites):
         """Lower-half blocks whose keys and values a draw at these sites changes, and whether the cache changes."""
         first = 0
@@ -319,7 +324,7 @@ class DustX(DUST):
             p = f'transformer.h.{j}.attn.'
             k_raw = self.outputs[p + 'c_k'].float().view(b, t, h, d)
             values = self.outputs[p + 'c_v'].float().view(b, t, h, d)
-            if has_ve(j, cfg.n_layer) and f'value_embeds.{j}' in self.outputs:
+            if f'value_embeds.{j}' in self.outputs and f'transformer.h.{j}.attn.ve_gate' in self.outputs:
                 z = self.outputs[p + 've_gate'].float()
                 values = values + (2 * torch.sigmoid(z)).unsqueeze(-1) * self.outputs[f'value_embeds.{j}'].float().view(b, t, h, d)
             readers = [j]
@@ -628,7 +633,7 @@ class DustX(DUST):
         cfg = self.model.config
         n, b, t, h, d = self.settings.nrep, self.batch, self.length, cfg.n_head, cfg.n_embd // cfg.n_head
         site_suffix = {'q': 'attn.c_q', 'k': 'attn.c_k', 'v': 'attn.c_v', 'gate': 'attn.ve_gate'}
-        layers = [i for i in range(cfg.n_layer) if kind not in ('ve', 'gate') or has_ve(i, cfg.n_layer)]
+        layers = [i for i in range(cfg.n_layer) if kind not in ('ve', 'gate') or self._has_ve(i)]
         sites = {
             i: f'value_embeds.{i}' if kind == 've' else f'transformer.h.{i}.{site_suffix[kind]}'
             for i in layers
@@ -649,7 +654,7 @@ class DustX(DUST):
         for i in layers:
             prefix = f'transformer.h.{i}.attn.'
             q, k, v = [self.outputs[prefix + 'c_' + name].float().view(b, t, h, d) for name in ('q', 'k', 'v')]
-            z = self.outputs[prefix + 've_gate'].float() if has_ve(i, cfg.n_layer) else None
+            z = self.outputs[prefix + 've_gate'].float() if self._has_ve(i) else None
             ve = self.outputs[f'value_embeds.{i}'].float().view(b, t, h, d) if z is not None else None
             values = v if z is None else v + (2 * torch.sigmoid(z)).unsqueeze(-1) * ve
             qp, kp = processed(q), processed(k)
@@ -1083,11 +1088,10 @@ class DustX(DUST):
                         q = f'transformer.h.{layer}.'
                         direct([q + 'attn.c_proj', q + 'mlp.c_proj'], k * r.writers[layer], 0.2)
                         direct([q + 'mlp.c_fc'], k * r.hidden[layer], 0.2)
-                    direct(['transformer.wte'], k * r.embedding, 0.2)
                 finally:
                     self._anchor_err = None
-            else:
-                direct(['transformer.wte'], r.embedding, 0.2)
+            # the embedding also reaches every block directly (x0_lambdas), past any anchor: full draws
+            direct(['transformer.wte'], r.embedding, 0.2)
             if self.chain_pool:
                 errors = self.pool_writers(errors)
             self._halves = {}
@@ -1155,6 +1159,9 @@ class DustX(DUST):
     def finish(self, x, y, optimizer, errors):
         r = self.settings
         grads = {}
+        if os.environ.get('DUST_DEBUG'):
+            print({s: round(e.float().norm().item(), 4) for s, e in errors.items()
+                   if s.endswith('c_proj') or s.endswith('c_fc') or s == 'transformer.wte'}, flush=True)
         if self.pool:
             errors = self.pool_writers(errors)
             self._halves = {}
