@@ -71,6 +71,9 @@ class DustX(DUST):
         # (the leakage into its reward; unbiased whatever the targets, since it depends only on other tokens'
         # noise); 'both': the two together ("symmetric readout")
         self.readout_mode = 'credit'
+        # anchored draws: sites below self-decoder block `anchor` rerun only up to it and score the change of the
+        # stream entering it against the error estimated there (block anchor-1's mlp.c_proj error)
+        self.anchor, self.anchor_scale, self._anchor_err = 0, 1, None
         self.readout_warmup, self._steps = 0, 0  # steps before the readout turns on (its targets start as noise)
         self._ro_names, self._ro_clean = set(), {}
         self.freeze_attn = False  # residual-stream draws: hold every later attention output (and the cache) clean
@@ -257,6 +260,13 @@ class DustX(DUST):
         return self._reps[n]
 
     def losses(self, x, y):
+        if self._anchor_err is not None:
+            n = x.shape[0] // self.batch
+            with self.autocast():
+                xa = self.model(x, None, start=self._start, state=self.rep_state(n), stop_at=self.anchor)
+            dx = xa.float().view(n, self.batch, self.length, -1) - self.state['x'][self.anchor].float().unsqueeze(0)
+            lin = torch.einsum('nbtd,btd->nbt', dx, self._anchor_err)
+            return (self.clean_loss.unsqueeze(0) + lin).reshape(n * self.batch, self.length)
         if self.score is None and self._start:
             with self.autocast():
                 return self.model(x, y, loss_reduction='none', start=self._start,
@@ -1055,12 +1065,29 @@ class DustX(DUST):
         if self.chain and not self.handoff and not self.kv_credit:
             # Full forwards only at residual-stream sites (writers, embedding), pooled across depths; MLP-hidden
             # and attention-output errors come from cheap local probes scored against the pooled stream errors.
-            for layer in range(L):
+            A = self.anchor if self.anchor and not self.chain_hidden and not self.chain_pool else 0
+            for layer in range(A, L):
                 p = f'transformer.h.{layer}.'
                 direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[layer], 0.2)
                 if not self.chain_hidden:
                     direct([p + 'mlp.c_fc'], r.hidden[layer], 0.2)
-            direct(['transformer.wte'], r.embedding, 0.2)
+            if A:
+                # block A-1's writers by full draws give the anchor error; everything below reruns only to block A
+                p = f'transformer.h.{A - 1}.'
+                direct([p + 'attn.c_proj', p + 'mlp.c_proj'], r.writers[A - 1], 0.2)
+                self._anchor_err = errors[p + 'mlp.c_proj'].float()
+                k = self.anchor_scale
+                try:
+                    direct([p + 'mlp.c_fc'], k * r.hidden[A - 1], 0.2)
+                    for layer in range(A - 1):
+                        q = f'transformer.h.{layer}.'
+                        direct([q + 'attn.c_proj', q + 'mlp.c_proj'], k * r.writers[layer], 0.2)
+                        direct([q + 'mlp.c_fc'], k * r.hidden[layer], 0.2)
+                    direct(['transformer.wte'], k * r.embedding, 0.2)
+                finally:
+                    self._anchor_err = None
+            else:
+                direct(['transformer.wte'], r.embedding, 0.2)
             if self.chain_pool:
                 errors = self.pool_writers(errors)
             self._halves = {}

@@ -102,6 +102,10 @@ def main():
     p.add_argument('--readout-mode', choices=['credit', 'leak', 'both'], default='credit',
                    help='readout: credit later tokens\' loss changes to t (credit), cancel the predicted leakage into each '
                         'token\'s own reward (leak), or both (symmetric readout)')
+    p.add_argument('--anchor', type=int, default=0,
+                   help='anchored draws: sites below this self-decoder block rerun only up to it, scored against the '
+                        'error there (needs --chain without pooling)')
+    p.add_argument('--anchor-scale', type=int, default=1, help='multiply the anchored sites\' draws')
     p.add_argument('--readout-warmup', type=int, default=0, help='steps of plain Dust before --readout turns on')
     p.add_argument('--cache-separate', action='store_true', help='leak-free scoring for the YOCO cache k/v too')
     p.add_argument('--local-separate', action='store_true', help='leak-free local k/v/gate/ve scoring (closed form)')
@@ -199,6 +203,7 @@ def main():
         estimator.readout_warmup = args.readout_warmup
         estimator.readout_scale = args.readout_scale
         estimator.readout_mode = args.readout_mode
+        estimator.anchor, estimator.anchor_scale = args.anchor, args.anchor_scale
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
         estimator.cache_gamma = args.cache_gamma

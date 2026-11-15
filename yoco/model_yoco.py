@@ -97,8 +97,9 @@ class YOCO(GPT):
         return norm(apply_rotary_emb(k, cos, sin)), v
 
     def forward(self, idx, targets=None, loss_reduction='mean', stop_at_handoff=False, start=0, state=None,
-                record=None):
-        """start/state/record as in GPT.forward; state also holds the clean cache (k, v) for start >= n_self."""
+                record=None, stop_at=None):
+        """start/state/record as in GPT.forward; state also holds the clean cache (k, v) for start >= n_self.
+        stop_at (a self-decoder block): return the stream entering that block (for anchored draws)."""
         B, T = idx.size()
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
         if start:
@@ -110,6 +111,8 @@ class YOCO(GPT):
             record['x0'], record['x'] = x0, {}
         if start <= self.n_self:
             for i in range(start, self.n_self):
+                if stop_at == i:
+                    return x
                 if record is not None:
                     record['x'][i] = x
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
