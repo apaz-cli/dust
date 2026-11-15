@@ -58,6 +58,8 @@ class DustX(DUST):
         # block's MLP output for its MLP input, block 0's attention output for the embedding). A prediction fixed
         # before the draws keeps the estimate unbiased; the ridge fit and trust scale decide how much it is used.
         self.cv_neighbor, self._cv_extra = False, {}
+        # own-input control variate: the prediction also uses the clean stream entering the site's block (no noise)
+        self.cv_own = False
         self.cv_stats = {}           # site -> [sum raw reward^2, sum corrected reward^2] since last read
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
@@ -1102,8 +1104,12 @@ class DustX(DUST):
             A = self.anchor if self.anchor and self._steps > self.anchor_warmup and not self.chain_hidden \
                 and not self.chain_pool else 0
             nb = self.cv and self.cv_neighbor
+            own = self.cv and self.cv_own
             for layer in (reversed(range(A, L)) if nb else range(A, L)):  # top-down: the neighbors come first
                 p = f'transformer.h.{layer}.'
+                if own:
+                    xs = self.state['x'][layer]
+                    self._cv_extra = {p + s: xs for s in ('attn.c_proj', 'mlp.c_proj', 'mlp.c_fc')}
                 if nb:
                     up = errors.get(f'transformer.h.{layer + 1}.attn.c_proj')
                     self._cv_extra = {p + 'attn.c_proj': up, p + 'mlp.c_proj': up} if up is not None else {}
@@ -1111,6 +1117,8 @@ class DustX(DUST):
                 if not self.chain_hidden:
                     if nb:
                         self._cv_extra = {p + 'mlp.c_fc': errors[p + 'mlp.c_proj']}
+                    elif own:
+                        self._cv_extra = {p + 'mlp.c_fc': self.state['x'][layer]}
                     direct([p + 'mlp.c_fc'], r.hidden[layer], 0.2)
             self._cv_extra = {}
             if A:
