@@ -29,6 +29,32 @@ from yoco.model_yoco import build  # noqa: E402
 from mlsweep.logger import MLSweepLogger  # noqa: E402  (no-op outside an mlsweep worker)
 
 
+class TensorAdam(torch.optim.Optimizer):
+    """Adam with one second moment per tensor instead of per coordinate. It still adapts the step to each tensor's
+    gradient size (as MoE experts that see few tokens need), but within a tensor keeps the update's direction, so
+    coordinates where Dust's noise was removed (the control variate) are not rescaled back up."""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-8):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps))
+
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            b1, b2 = g['betas']
+            for p_ in g['params']:
+                if p_.grad is None:
+                    continue
+                s = self.state[p_]
+                if not s:
+                    s['t'], s['m'], s['v'] = 0, torch.zeros_like(p_), 0.0
+                s['t'] += 1
+                s['m'].mul_(b1).add_(p_.grad, alpha=1 - b1)
+                s['v'] = b2 * s['v'] + (1 - b2) * p_.grad.float().square().mean().item()
+                mh = s['m'] / (1 - b1 ** s['t'])
+                vh = s['v'] / (1 - b2 ** s['t'])
+                p_.add_(mh, alpha=-g['lr'] / (vh ** 0.5 + g['eps']))
+
+
 def split(batch, noloss=8192):
     """Inputs and targets from token rows; tokens >= noloss are real tokens (minus noloss) with no loss."""
     x = (batch[:, :-1] % noloss).contiguous()
@@ -120,7 +146,8 @@ def main():
     p.add_argument('--oracle-re', help='regex on parameter names given their noise-free expected update')
     p.add_argument('--oracle', nargs='*', default=[], help='groups given their noise-free expected update')
     p.add_argument('--moe', help='routed MoE MLPs: "E,k,h,hs" (experts, top-k, expert hidden, shared hidden)')
-    p.add_argument('--opt', choices=['sgd', 'adamw'], default='sgd', help='adamw: bp reference optimizer (lr --adam-lr)')
+    p.add_argument('--opt', choices=['sgd', 'adamw', 'adam_tensor'], default='sgd',
+                   help='adamw: bp reference optimizer (lr --adam-lr); adam_tensor: Adam with one second moment per tensor')
     p.add_argument('--adam-lr', type=float, default=3e-3)
     p.add_argument('--adam-beta2', type=float, default=0.95)
     p.add_argument('--adam-eps', type=float, default=1e-8)
@@ -182,6 +209,8 @@ def main():
         groups_ = [dict(params=rest)] + ([dict(params=router, lr=args.adam_lr * args.router_lr_mult)] if router else [])
         optimizer = torch.optim.AdamW(groups_, lr=args.adam_lr, betas=(0.9, args.adam_beta2), eps=args.adam_eps,
                                       weight_decay=0.0)
+    if args.opt == 'adam_tensor':
+        optimizer = TensorAdam(model.parameters(), lr=args.adam_lr, betas=(0.9, args.adam_beta2), eps=args.adam_eps)
     if args.moe and args.moe_lr_mult != 1.0:
         expert = {id(p_) for n, p_ in model.named_parameters() if n.endswith(('w_fc', 'w_proj'))}
         groups = []
