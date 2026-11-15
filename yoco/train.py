@@ -99,6 +99,7 @@ def main():
     p.add_argument('--sim-noise', type=float, default=0.0, help='ed only: noise simulator, Dust-sized noise C d / N per site')
     p.add_argument('--sim-kv-head', action='store_true', help='noise simulator: size key/value noise by the head width')
     p.add_argument('--sim-tail', help='noise simulator: heavy tails at the same variance, "DF,elem" or "DF,token"')
+    p.add_argument('--sim-floor', type=float, default=0.0, help='noise simulator: noise floor, a share of the mean per-token error')
     p.add_argument('--sim-cv', help='noise simulator: JSON of control-variate shares per site (cv_explained of a recipe run)')
     p.add_argument('--n-self', type=int, help='YOCO self-decoder depth (default n_layer // 2)')
     p.add_argument('--freeze-attn', action='store_true', help='residual-stream draws hold later attention and the cache clean')
@@ -236,6 +237,7 @@ def main():
                 emb, loc = settings.embedding, settings.local  # already scaled by the --*-scale flags
 
                 r2 = json.loads(Path(args.sim_cv).read_text()) if args.sim_cv else {}
+                expected.FLOOR = args.sim_floor
                 if args.sim_tail:
                     df_, mode_ = args.sim_tail.split(',')
                     expected.TAIL = (float(df_), mode_)

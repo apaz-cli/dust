@@ -32,6 +32,9 @@ NOISE = {}
 # Heavy tails at the same variance: TAIL = (df, 'elem' | 'token'); Student-t noise per number, or Gaussian noise
 # scaled per token by a Student-t factor (a whole token's reward unusually large). None: Gaussian.
 TAIL = None
+# Noise floor: each token's noise scale is sqrt(|g_t|^2 + FLOOR * mean over tokens of |g|^2), so tokens with tiny
+# errors still get noise (as leakage and curvature give real Dust). 0: noise proportional to each token's error.
+FLOOR = 0.0
 
 
 def _noise_like(g):
@@ -53,7 +56,10 @@ class _NoisyGrad(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g):
-        scale = g.float().norm(dim=-1, keepdim=True) / g.shape[-1] ** 0.5
+        sq = g.float().square().sum(-1, keepdim=True)
+        if FLOOR:
+            sq = sq + FLOOR * sq.mean()
+        scale = (sq / g.shape[-1]).sqrt()
         return g + (ctx.rho * scale * _noise_like(g)).to(g.dtype), None
 
 
