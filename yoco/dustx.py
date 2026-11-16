@@ -63,6 +63,7 @@ class DustX(DUST):
         # MoE fix: live units also for the routed experts' units (only the shared expert had them), and no control
         # variate at the expert and router sites, whose units belong to a different expert for each token
         self.moe_fix = False
+        self.orth = ()  # site-name endings that get orthogonal draws (noise PR #5)
         self.cv_stats = {}           # site -> [sum raw reward^2, sum corrected reward^2] since last read
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
@@ -435,6 +436,22 @@ class DustX(DUST):
             for k in [k for k in self._draw_outs if k not in self._aug]:
                 del self._draw_outs[k]
 
+    def orth_plan(self, w):
+        """Orthogonal draws (noise PR #5): a random orthogonal basis of the site's width, scaled so each draw has the
+        variance of a standard Gaussian, a random starting row per token and a random sign per token and number. Draw j
+        of token t uses row (start_t + j) mod w, so a token's draws never repeat a direction until w draws."""
+        g = self.generator
+        Q = torch.linalg.qr(torch.randn(w, w, device=self.device, generator=g))[0] * w ** 0.5
+        start = torch.randint(0, w, (self.batch, self.length), device=self.device, generator=g)
+        sign = torch.randint(0, 2, (self.batch, self.length, w), device=self.device, generator=g).float() * 2 - 1
+        return Q, start, sign
+
+    def orth_noise(self, plan, j0, n):
+        Q, start, sign = plan
+        w = Q.shape[0]
+        rows = (start.unsqueeze(0) + j0 + torch.arange(n, device=self.device).view(n, 1, 1)) % w  # [n, b, t]
+        return (Q[rows] * sign.unsqueeze(0)).reshape(n * self.batch, self.length, w).to(self.dtype)
+
     def _direct_errors(self, sites, draws, sigma):
         self._start = self.start_for(sites) if self.score is None else 0
         n = self.settings.nrep
@@ -454,8 +471,10 @@ class DustX(DUST):
                     mu = self.cv_alpha(s) * raw
                     mus[s] = mu * masks[s] if s in masks else mu
 
-        for _ in range(draws // n):
-            noise = {s: self.noise(n * self.batch, self.length, width(s)) for s in sites}
+        orth = {s: self.orth_plan(width(s)) for s in sites if self.orth and s.endswith(self.orth)}
+        for c in range(draws // n):
+            noise = {s: self.orth_noise(orth[s], c * n, n) if s in orth else self.noise(n * self.batch, self.length, width(s))
+                     for s in sites}
             for s, mask in masks.items():
                 noise[s] = noise[s] * mask.repeat(n, 1, 1)
             self.jitter = {s: sigma * a for s, a in noise.items()}

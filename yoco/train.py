@@ -160,6 +160,7 @@ def main():
     p.add_argument('--moe-fix', action='store_true', help='Dust MoE: live units for the routed experts; no control variate at expert/router sites')
     p.add_argument('--router-cap', type=float, default=0.0, help='MoE: soft cap on router logits, c*tanh(x/c) (0: off)')
     p.add_argument('--router-wd', type=float, default=0.0, help='MoE with AdamW: decoupled weight decay on the router only')
+    p.add_argument('--orth', nargs='*', default=[], help='orthogonal draws at sites ending with these (e.g. mlp.moe mlp.c_fc)')
     p.add_argument('--moe-layers', type=int, nargs='*', help='layers that get the MoE (default all)')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
@@ -253,6 +254,7 @@ def main():
         estimator.anchor, estimator.anchor_scale = args.anchor, args.anchor_scale
         estimator.cv_neighbor, estimator.cv_own = args.cv_neighbor, args.cv_own
         estimator.moe_fix = args.moe_fix
+        estimator.orth = tuple(args.orth)
         estimator.anchor_boost, estimator.anchor_warmup = args.anchor_boost, args.anchor_warmup
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
