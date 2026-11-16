@@ -64,6 +64,7 @@ class DustX(DUST):
         # variate at the expert and router sites, whose units belong to a different expert for each token
         self.moe_fix = False
         self.orth = ()  # site-name endings that get orthogonal draws (noise PR #5)
+        self.moe_cv = False  # with moe_fix: a control variate fitted per expert at the expert sites
         self.expert_probes = 0  # MoE: experts' hidden errors from this many local probes instead of full draws
         self.cv_stats = {}           # site -> [sum raw reward^2, sum corrected reward^2] since last read
 
@@ -216,6 +217,55 @@ class DustX(DUST):
             st['num'] = b * st['num'] + (1 - b) * (gf * raw).sum().item()
             st['den'] = b * st['den'] + (1 - b) * raw.square().sum().item()
         st['S'] = b * st['S'] + (1 - b) * gf.T @ k / k.shape[0]
+
+    def _moe_slots(self, site):
+        """For an expert site: its MoE module, the token-slot pairs routed to each expert, and the key per token."""
+        q = site[:-len('moe')]
+        m = self.modules_moe[q]
+        ids = self.outputs[q + 'ids'].reshape(-1, m.k)                       # [N, k]
+        key = self._cv_key.reshape(-1, self._cv_key.shape[-1])              # [N, dk]
+        return m, [(ids == e).nonzero(as_tuple=True) for e in range(m.E)], key
+
+    def cv_predict_moe(self, site):
+        """Per-expert control variate: for each expert its own ridge map from the head-error key to its hidden
+        units' error, fit only on the tokens routed to it (a shared map mixes experts, since a slot's units belong to a
+        different expert for each token). Fixed before the draws, so unbiased."""
+        st = self._cv.get(site)
+        if st is None or 'S' not in st:
+            return None
+        m, slots, key = self._moe_slots(site)
+        N = key.shape[0]
+        pred = torch.zeros(N, m.k, m.h, device=key.device)
+        for e, (n_, j_) in enumerate(slots):
+            P, S = st['P'][e], st['S'][e]
+            if len(n_) == 0 or not (torch.isfinite(P).all() and torch.isfinite(S).all()) or P.diagonal().mean() <= 0:
+                continue
+            reg = (0.1 * P.diagonal().mean() + 1e-12) * torch.eye(P.shape[0], device=P.device)
+            try:
+                M = torch.linalg.solve(P + reg, S.T).T                       # [h, dk]
+            except torch.linalg.LinAlgError:
+                continue
+            pred[n_, j_] = key[n_] @ M.T
+        st['raw'] = pred.reshape(self.batch, self.length, m.k * m.h)
+        return st['raw']
+
+    def cv_update_moe(self, site, g):
+        m, slots, key = self._moe_slots(site)
+        N, dk = key.shape
+        gf = g.reshape(N, m.k, m.h)
+        b = self.cv_beta
+        st = self._cv.setdefault(site, dict(num=0., den=0.))
+        if 'S' not in st:
+            st['S'] = torch.zeros(m.E, m.h, dk, device=g.device)
+            st['P'] = torch.zeros(m.E, dk, dk, device=g.device)
+        if 'raw' in st:
+            raw = st.pop('raw').reshape(N, m.k, m.h)
+            st['num'] = b * st['num'] + (1 - b) * (gf * raw).sum().item()
+            st['den'] = b * st['den'] + (1 - b) * raw.square().sum().item()
+        for e, (n_, j_) in enumerate(slots):
+            ke = key[n_]
+            st['S'][e] = b * st['S'][e] + (1 - b) * gf[n_, j_].T @ ke / N
+            st['P'][e] = b * st['P'][e] + (1 - b) * ke.T @ ke / N
 
     def cv_alpha(self, site):
         st = self._cv[site]
@@ -465,9 +515,12 @@ class DustX(DUST):
         mus, use_cv = {}, self.cv and self.score is None and not self.res_gamma
         if use_cv:
             for s in sites:
-                if self.moe_fix and s.endswith(('mlp.moe', 'mlp.gate')):
+                if self.moe_fix and s.endswith('mlp.moe') and self.moe_cv:
+                    raw = self.cv_predict_moe(s)
+                elif self.moe_fix and s.endswith(('mlp.moe', 'mlp.gate')):
                     continue  # their units change meaning token by token (whichever expert was chosen)
-                raw = self.cv_predict(s)
+                else:
+                    raw = self.cv_predict(s)
                 if raw is not None and self._cv_steps > self.cv_warmup:
                     mu = self.cv_alpha(s) * raw
                     mus[s] = mu * masks[s] if s in masks else mu
@@ -525,7 +578,9 @@ class DustX(DUST):
         out = {s: error / draws + mus[s] if s in mus else error / draws for s, error in errors.items()}
         if use_cv:
             for s, g in out.items():
-                if not (self.moe_fix and s.endswith(('mlp.moe', 'mlp.gate'))):
+                if self.moe_fix and s.endswith('mlp.moe') and self.moe_cv:
+                    self.cv_update_moe(s, g)
+                elif not (self.moe_fix and s.endswith(('mlp.moe', 'mlp.gate'))):
                     self.cv_update(s, g)
         return out
 

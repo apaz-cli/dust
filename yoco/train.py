@@ -162,6 +162,7 @@ def main():
     p.add_argument('--router-wd', type=float, default=0.0, help='MoE with AdamW: decoupled weight decay on the router only')
     p.add_argument('--orth', nargs='*', default=[], help='orthogonal draws at sites ending with these (e.g. mlp.moe mlp.c_fc)')
     p.add_argument('--expert-probes', type=int, default=0, help='Dust MoE: expert hidden errors from N local probes against the layer output error (0: full draws)')
+    p.add_argument('--moe-cv', action='store_true', help='with --moe-fix: control variate fitted per expert at the expert sites')
     p.add_argument('--moe-layers', type=int, nargs='*', help='layers that get the MoE (default all)')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
@@ -257,6 +258,7 @@ def main():
         estimator.moe_fix = args.moe_fix
         estimator.orth = tuple(args.orth)
         estimator.expert_probes = args.expert_probes
+        estimator.moe_cv = args.moe_cv
         estimator.anchor_boost, estimator.anchor_warmup = args.anchor_boost, args.anchor_warmup
         estimator.chain_draws = args.chain or 256
         estimator.linear_v = args.linear_v
