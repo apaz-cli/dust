@@ -103,7 +103,7 @@ def main():
     p.add_argument('--draw-ramp', action='store_true',
                    help='same total draws, spent late: 0.75x for the first 60%% of steps, then linear 0.75x -> 2x')
     p.add_argument('--ema', type=float, default=0.995, help='track an EMA of the weights (eval only); 0 disables')
-    p.add_argument('--clip', type=float, default=0.0,
+    p.add_argument('--clip', type=float, default=2.0,
                    help='adaptive clipping: scale a step whose gradient norm exceeds CLIP x its running average (0: off)')
     p.add_argument('--microbatch-size', type=int, default=0,
                    help='Dust: gradient accumulation over microbatches of this many sequences, one optimizer step')
