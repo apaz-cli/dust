@@ -10,7 +10,7 @@
 from _common import LEAKFREE_CV, PY, UPLOAD_EXCLUDE  # noqa: F401
 
 COMMAND = [PY, "yoco/train.py", "--arch", "yoco", "--seed", "42", "--data-dir", "data/tinystories_long",
-           "--local-scale", "1", "--microbatch-size", "8", "--opt", "adamw", "--adam-lr", "3e-3", "--moe-fix"] + LEAKFREE_CV
+           "--local-scale", "1", "--microbatch-size", "32", "--opt", "adamw", "--adam-lr", "3e-3", "--moe-fix"] + LEAKFREE_CV
 MOE = ["--moe", "8,2,384,256", "--router-cap", "2", "--router-wd", "10"]
 S32, S64, S128 = (["--batch-seqs", str(n), "--steps", "1500"] for n in (32, 64, 128))
 L64 = ["--batch-seqs", "64", "--steps", "6000"]
