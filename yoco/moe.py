@@ -101,6 +101,46 @@ class MoE(nn.Module):
             out = out + self.c_proj(F.relu(self.c_fc(x)).square()).float()
         return out.to(x.dtype)
 
+    @torch.no_grad()
+    def local_expert_errors(self, est, prefix, e_out, draws, sigma=0.2, n=8):
+        """Error at the routed pre-activations (site prefix+'moe') from local probes instead of full reruns: jitter
+        each token's live expert units, rerun only relu^2 and that expert's output projection (times its gate weight),
+        and score the change of the layer output against e_out, the error there (estimated from all tokens). Antithetic
+        pairs; forward only. Returns [b, t, k*h]."""
+        pre = est.outputs[prefix + 'moe'].float()                          # [b, t, k*h]
+        b, t, _ = pre.shape
+        N = b * t
+        ids = est.outputs[prefix + 'ids'].reshape(-1)                      # [N*k]
+        w = est.inputs[prefix + 'w'].reshape(-1)                           # [N*k]
+        pre = pre.reshape(N * self.k, self.h)
+        live = (pre > 0).float()
+        base = F.relu(pre).square()
+        tok = torch.arange(N, device=pre.device).repeat_interleave(self.k)
+        order = ids.argsort()
+        eid = ids[order]
+        counts = torch.bincount(ids, minlength=self.E)
+        rank = torch.arange(N * self.k, device=pre.device) - (torch.cumsum(counts, 0) - counts)[eid]
+        cap = int(counts.max())
+        Wp = self.w_proj.float()
+        eo = e_out.reshape(N, -1)[tok] * w[:, None]                        # [N*k, d]: each slot's output error, gated
+        est_ = torch.zeros_like(pre)
+
+        def project(dh):  # [m, N*k, h] -> [m, N*k, d] through each slot's expert
+            m = dh.shape[0]
+            Hp = torch.zeros(m, self.E, cap, self.h, device=pre.device)
+            Hp[:, eid, rank] = dh[:, order]
+            Y = torch.einsum('mech,edh->mecd', Hp, Wp)[:, eid, rank]
+            out = torch.empty(m, N * self.k, Y.shape[-1], device=pre.device)
+            out[:, order] = Y
+            return out
+        for _ in range(draws // n):
+            a = torch.randn(n, N * self.k, self.h, device=pre.device, generator=est.generator) * live
+            dp = project(F.relu(pre + sigma * a).square() - base)
+            dm = project(F.relu(pre - sigma * a).square() - base)
+            score = ((dp - dm) / 2 * eo).sum(-1)                           # [n, N*k]
+            est_ += (score.unsqueeze(-1) * a).sum(0) / sigma
+        return (est_ / draws).reshape(b, t, self.k * self.h)
+
     def dust_grads(self, est, prefix, e_pre, e_gate, e_out):
         """Weight estimates from the site errors: e_pre [b,t,k*h] at the routed pre-activations, e_gate [b,t,k] at
         the selected router logits, e_out [b,t,d] at the layer output (the shared expert's c_proj site)."""

@@ -64,6 +64,7 @@ class DustX(DUST):
         # variate at the expert and router sites, whose units belong to a different expert for each token
         self.moe_fix = False
         self.orth = ()  # site-name endings that get orthogonal draws (noise PR #5)
+        self.expert_probes = 0  # MoE: experts' hidden errors from this many local probes instead of full draws
         self.cv_stats = {}           # site -> [sum raw reward^2, sum corrected reward^2] since last read
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
@@ -1078,7 +1079,7 @@ class DustX(DUST):
             if count > 0:
                 if self.moe_prefixes:  # MoE layer: the routed hidden units and gate logits join the hidden draws
                     sites = sites + [q + suf for q in self.moe_prefixes for s_ in sites if s_ == q + 'c_fc'
-                                     for suf in ('moe', 'gate')]
+                                     for suf in (('gate',) if self.expert_probes else ('moe', 'gate'))]
                 errors.update(self.direct_errors(sites, count, sigma))
 
         def hub(layer):
@@ -1245,6 +1246,9 @@ class DustX(DUST):
             errors['lm_head'] = self.head_error(r.head)
 
         for q in self.moe_prefixes:
+            if self.expert_probes:  # the experts' hidden errors from local probes against the layer output's error
+                errors[q + 'moe'] = self.modules_moe[q].local_expert_errors(self, q, errors[q + 'c_proj'],
+                                                                           self.expert_probes)
             grads.update(self.modules_moe[q].dust_grads(self, q, errors.pop(q + 'moe'), errors.pop(q + 'gate'),
                                                         errors[q + 'c_proj']))
         for site, error in errors.items():
