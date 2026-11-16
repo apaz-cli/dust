@@ -28,6 +28,8 @@ class MoE(nn.Module):
         self.register_buffer('balance_bias', torch.zeros(experts))
         self.register_buffer('load', torch.zeros(experts))  # tokens routed per expert, accumulated since last update
         self.dust = None
+        self.cap = 0.0        # soft cap on router logits (0: off)
+        self.logit_rms = 0.0  # size of the router logits in the last clean pass, for logging
 
     def init_weights(self):
         d = self.w_fc.shape[-1]
@@ -46,8 +48,12 @@ class MoE(nn.Module):
         the routed pre-activations (site prefix+'moe', width k*h) and the selected router logits (site
         prefix+'gate', width k); draws reuse the clean routing and add the estimator's jitter at those sites."""
         B, T, d = x.shape
-        logits = self.router(x).float()                              # [B, T, E]
+        raw = self.router(x).float()                                 # [B, T, E]
+        capf = (lambda z: self.cap * torch.tanh(z / self.cap)) if self.cap else (lambda z: z)
+        logits = capf(raw)
         est, prefix = self.dust if self.dust is not None else (None, None)
+        if est is None or est.capturing:
+            self.logit_rms = raw.detach().square().mean().sqrt().item()
         if est is not None and (prefix + 'moe' in est.jitter or prefix + 'gate' in est.jitter):
             ids = est.outputs[prefix + 'ids']  # draws at this layer's own sites keep the clean routing
             ids = ids.repeat(B // ids.shape[0], 1, 1)
@@ -55,10 +61,10 @@ class MoE(nn.Module):
             ids = (torch.sigmoid(logits) + self.balance_bias).topk(self.k, dim=-1).indices
             if est is None or est.capturing or not est.jitter:
                 self.load += torch.bincount(ids.flatten(), minlength=self.E).float()
-        sel = logits.gather(-1, ids)                                  # [B, T, k]
+        sel = raw.gather(-1, ids)                                     # [B, T, k], before the cap: the gate site
         if est is not None and prefix + 'gate' in est.jitter:
             sel = sel + est.jitter[prefix + 'gate'].float()
-        w = torch.sigmoid(sel)
+        w = torch.sigmoid(capf(sel))
         w = w / w.sum(-1, keepdim=True)
         xf = x.reshape(-1, d)
         N = xf.shape[0]

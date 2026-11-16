@@ -158,6 +158,8 @@ def main():
     p.add_argument('--moe-balance-rate', type=float, default=1e-3, help='step of the load-balancing bias per update')
     p.add_argument('--moe-lr-mult', type=float, default=1.0, help='lr multiplier for routed expert weights')
     p.add_argument('--moe-fix', action='store_true', help='Dust MoE: live units for the routed experts; no control variate at expert/router sites')
+    p.add_argument('--router-cap', type=float, default=0.0, help='MoE: soft cap on router logits, c*tanh(x/c) (0: off)')
+    p.add_argument('--router-wd', type=float, default=0.0, help='MoE with AdamW: decoupled weight decay on the router only')
     p.add_argument('--moe-layers', type=int, nargs='*', help='layers that get the MoE (default all)')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
@@ -206,13 +208,15 @@ def main():
         E, k, h, hs = (int(v) for v in args.moe.split(','))
         for m_ in moe.install(model, E, k, h, hs, args.moe_layers):
             m_.rate = args.moe_balance_rate
+            m_.cap = args.router_cap
         if args.method != 'dust':
             model.requires_grad_(False)  # build() leaves params frozen; the bp branch re-enables them below
     optimizer = make_optimizer(model, settings)
     if args.opt == 'adamw':
         router = [p_ for n_, p_ in model.named_parameters() if 'mlp.router' in n_]
         rest = [p_ for n_, p_ in model.named_parameters() if 'mlp.router' not in n_]
-        groups_ = [dict(params=rest)] + ([dict(params=router, lr=args.adam_lr * args.router_lr_mult)] if router else [])
+        groups_ = [dict(params=rest)] + ([dict(params=router, lr=args.adam_lr * args.router_lr_mult,
+                                               weight_decay=args.router_wd)] if router else [])
         optimizer = torch.optim.AdamW(groups_, lr=args.adam_lr, betas=(0.9, args.adam_beta2), eps=args.adam_eps,
                                       weight_decay=0.0)
     if args.opt == 'adam_tensor':
@@ -335,9 +339,23 @@ def main():
         # recent norms).
         raw_step = optimizer.step
 
+        def part(n_):  # which part of the model a parameter belongs to, for the per-part gradient norms
+            for key, name_ in (('mlp.router', 'router'), ('mlp.w_', 'experts'), ('.mlp.', 'mlp'), ('.attn.', 'attn'),
+                               ('cache_', 'cache'), ('wte', 'embedding'), ('value_embeds', 'value_embeds'),
+                               ('lm_head', 'head')):
+                if key in n_:
+                    return name_
+            return 'other'
+        parts = [(part(n_), p_) for n_, p_ in model.named_parameters()]
+
         def clipped_step(*a, **kw):
             grads = [p_.grad for p_ in model.parameters() if p_.grad is not None]
             norm = torch.sqrt(sum(g.float().square().sum() for g in grads)).item()
+            sq = {}
+            for k_, p_ in parts:
+                if p_.grad is not None:
+                    sq[k_] = sq.get(k_, 0.0) + p_.grad.float().square().sum()
+            clip_state['parts'] = {k_: round(v_.sqrt().item(), 4) for k_, v_ in sq.items()}
             st = clip_state
             st['steps'] += 1
             limit = args.clip * st['avg'] if st['avg'] is not None else math.inf
@@ -416,6 +434,9 @@ def main():
         rec = dict(step=step, train_loss=loss, seconds=round(time.monotonic() - start, 1))
         if args.clip:
             rec['grad_norm'], rec['clipped'] = clip_state['norm'], clip_state['clipped']
+            rec['grad_norm_part'] = clip_state.get('parts', {})
+        if args.moe:
+            rec['router_rms'] = [round(m_.logit_rms, 3) for m_ in model.modules() if hasattr(m_, 'logit_rms')]
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
         high = high + 1 if loss > 10 else 0
         # diverged: a non-finite loss, the loss above 10 for 5 steps in a row (a single spike may recover), or the
