@@ -9,8 +9,14 @@ from _common import LEAKFREE_CV, PY, UPLOAD_EXCLUDE  # noqa: F401
 COMMAND = [PY, "yoco/train.py", "--arch", "yoco", "--seed", "42", "--data-dir", "data/tinystories_long", "--steps", "1500",
            "--local-scale", "1", "--microbatch-size", "8", "--batch-seqs", "32", "--opt", "adamw", "--adam-lr", "3e-3",
            "--moe", "8,2,384,256", "--moe-fix"] + LEAKFREE_CV
-OPTIONS = {".arm": {"values": ["base", "cap5", "cap2", "wd1", "wd10"],
+OPTIONS = {".arm": {"values": ["base", "cap5", "cap2", "wd1", "wd10", "cap2_wd10", "wd10_h16"],
                     "flags": {"base": [], "cap5": ["--router-cap", "5"], "cap2": ["--router-cap", "2"],
-                              "wd1": ["--router-wd", "1"], "wd10": ["--router-wd", "10"]}}}
+                              "wd1": ["--router-wd", "1"], "wd10": ["--router-wd", "10"],
+                              "cap2_wd10": ["--router-cap", "2", "--router-wd", "10"],
+                              "wd10_h16": ["--router-wd", "10", "--alloc", '{"hidden": [608, 512, 256, 160]}']}}}
 METRIC = "val_loss"
 GOAL = "minimize"
+
+
+def EXCLUDE(combo):  # the first five ran in moe_router_stab_l4_20261115_2230_ebea
+    return combo["arm"] not in ("cap2_wd10", "wd10_h16")
