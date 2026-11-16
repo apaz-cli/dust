@@ -60,6 +60,9 @@ class DustX(DUST):
         self.cv_neighbor, self._cv_extra = False, {}
         # own-input control variate: the prediction also uses the clean stream entering the site's block (no noise)
         self.cv_own = False
+        # MoE fix: live units also for the routed experts' units (only the shared expert had them), and no control
+        # variate at the expert and router sites, whose units belong to a different expert for each token
+        self.moe_fix = False
         self.cv_stats = {}           # site -> [sum raw reward^2, sum corrected reward^2] since last read
 
         self.oracle = set(oracle)  # parameter groups that get their noise-free expected update instead
@@ -439,10 +442,13 @@ class DustX(DUST):
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
         errors = {s: torch.zeros(self.batch, self.length, width(s), device=self.device) for s in sites}
         halves, chunk = {}, 0
-        masks = {s: self.outputs[s] > 0 for s in sites if self.live_fc and s.endswith('mlp.c_fc')}
+        live = ('mlp.c_fc', 'mlp.moe') if self.moe_fix else ('mlp.c_fc',)
+        masks = {s: self.outputs[s] > 0 for s in sites if self.live_fc and s.endswith(live)}
         mus, use_cv = {}, self.cv and self.score is None and not self.res_gamma
         if use_cv:
             for s in sites:
+                if self.moe_fix and s.endswith(('mlp.moe', 'mlp.gate')):
+                    continue  # their units change meaning token by token (whichever expert was chosen)
                 raw = self.cv_predict(s)
                 if raw is not None and self._cv_steps > self.cv_warmup:
                     mu = self.cv_alpha(s) * raw
@@ -499,7 +505,8 @@ class DustX(DUST):
         out = {s: error / draws + mus[s] if s in mus else error / draws for s, error in errors.items()}
         if use_cv:
             for s, g in out.items():
-                self.cv_update(s, g)
+                if not (self.moe_fix and s.endswith(('mlp.moe', 'mlp.gate'))):
+                    self.cv_update(s, g)
         return out
 
     # ---- head ----
