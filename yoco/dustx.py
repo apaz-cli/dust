@@ -24,6 +24,42 @@ from dust import DUST
 from model import attention, apply_rotary_emb, has_ve, norm
 
 
+
+def _head_chunk_eager(raw_slab, a, lo, blk, tslab, target, z_t0, total_rel, slab_rel, clean, y, sigma, n):
+    """One chunk of head draws (n draws of one 256-logit slab): the per-draw loss change from the cached logits, scored
+    against the jitter. Elementwise over [n*b, t, slab], so it is compiled into a few fused kernels."""
+    b, t, slab = raw_slab.shape
+    rep = lambda x: x.repeat(n, *([1] * (x.dim() - 1)))
+    changed = 15 * torch.tanh((raw_slab.float().repeat(n, 1, 1) + sigma * a.float()) / 15)
+    in_slab = rep(tslab == blk)                                         # target lies in this slab
+    tgt = rep(target)
+    zt_new = torch.where(in_slab, changed.gather(-1, (tgt - lo).clamp(0, slab - 1).unsqueeze(-1)).squeeze(-1),
+                         rep(z_t0))
+    others = rep(total_rel - slab_rel.gather(-1, blk.view(1, 1, 1).expand(b, t, 1)).squeeze(-1)) * torch.exp(rep(z_t0) - zt_new)
+    mine = torch.exp(changed - zt_new.unsqueeze(-1))
+    cols = lo + torch.arange(slab, device=raw_slab.device)
+    mine = torch.where(in_slab.unsqueeze(-1) & (cols == tgt.unsqueeze(-1)), 0.0, mine)
+    loss = torch.log1p(others + mine.sum(-1)).view(n, b, t)
+    reward = torch.where(y.unsqueeze(0) != -1, clean.unsqueeze(0) - loss, 0)
+    if b > 1:
+        reward = reward - reward.mean(1, keepdim=True)
+    return torch.einsum('nbt,nbtd->btd', reward / sigma, a.float().view(n, b, t, slab))
+
+
+_head_chunk_compiled = None
+
+
+def _head_chunk(*args):
+    global _head_chunk_compiled
+    if not COMPILE:
+        return _head_chunk_eager(*args)
+    if _head_chunk_compiled is None:
+        _head_chunk_compiled = torch.compile(_head_chunk_eager, dynamic=False)
+    return _head_chunk_compiled(*args)
+
+
+COMPILE = False  # set by yoco/train.py (--compile): fuse the head draws' elementwise chain
+
 class DustX(DUST):
     def __init__(self, model, settings, seed=42, head='zo', local='zo', handoff=False, handoff_draws=None,
                  oracle=(), credit='gamma', attn_c=0.01, res_gamma=0.0, res_blocks=2):
@@ -214,8 +250,8 @@ class DustX(DUST):
             st['P'] = Pstep if 'P' not in st else b * st['P'] + (1 - b) * Pstep
         if 'raw' in st:
             raw = st.pop('raw').reshape(-1, gf.shape[1])
-            st['num'] = b * st['num'] + (1 - b) * (gf * raw).sum().item()
-            st['den'] = b * st['den'] + (1 - b) * raw.square().sum().item()
+            st['num'] = b * st['num'] + (1 - b) * (gf * raw).sum()
+            st['den'] = b * st['den'] + (1 - b) * raw.square().sum()
         st['S'] = b * st['S'] + (1 - b) * gf.T @ k / k.shape[0]
 
     def _moe_slots(self, site):
@@ -260,8 +296,8 @@ class DustX(DUST):
             st['P'] = torch.zeros(m.E, dk, dk, device=g.device)
         if 'raw' in st:
             raw = st.pop('raw').reshape(N, m.k, m.h)
-            st['num'] = b * st['num'] + (1 - b) * (gf * raw).sum().item()
-            st['den'] = b * st['den'] + (1 - b) * raw.square().sum().item()
+            st['num'] = b * st['num'] + (1 - b) * (gf * raw).sum()
+            st['den'] = b * st['den'] + (1 - b) * raw.square().sum()
         for e, (n_, j_) in enumerate(slots):
             ke = key[n_]
             st['S'][e] = b * st['S'][e] + (1 - b) * gf[n_, j_].T @ ke / N
@@ -269,7 +305,11 @@ class DustX(DUST):
 
     def cv_alpha(self, site):
         st = self._cv[site]
-        return min(max(st['num'] / st['den'], 0.0), 1.5) if st['den'] > 0 else 0.0
+        # kept on the GPU (no sync): num and den are tensors once a prediction has been scored
+        den = st['den']
+        if not torch.is_tensor(den):
+            return 0.0
+        return torch.where(den > 0, (st['num'] / den.clamp_min(1e-30)).clamp(0.0, 1.5), torch.zeros_like(den))
 
     def output_hook(self, name):
         base = DUST.output_hook(self, name)
@@ -552,8 +592,8 @@ class DustX(DUST):
                 reward = reward - reward.mean(0, keepdim=True)
             if use_cv:
                 st = self.cv_stats.setdefault(sites[0], [0.0, 0.0])
-                st[0] += raw_reward.square().sum().item()
-                st[1] += reward.square().sum().item()
+                st[0] = st[0] + raw_reward.square().sum()  # tensors: read once per logging step, not per draw
+                st[1] = st[1] + reward.square().sum()
             if self.res_gamma and any(self.res_site(s) for s in sites):
                 # credit token t's jitter with gamma-discounted later token losses (as DUST does for k/v)
                 t = self.length
@@ -609,22 +649,9 @@ class DustX(DUST):
             blk = (chunk * n * slabs // draws) % slabs  # each slab gets draws // slabs draws, n at a time
             lo = blk * slab
             a = self.noise(n * b, t, slab)
-            changed = 15 * torch.tanh((raw[..., lo:lo + slab].float().repeat(n, 1, 1) + sigma * a.float()) / 15)
-            in_slab = rep(tslab == blk)                                     # target lies in this slab
-            tgt = rep(target)
-            zt_new = torch.where(in_slab, changed.gather(-1, (tgt - lo).clamp(0, slab - 1).unsqueeze(-1)).squeeze(-1),
-                                 rep(z_t[..., 0]))
-            others = rep(total_rel - slab_rel[..., blk]) * torch.exp(rep(z_t[..., 0]) - zt_new)
-            mine = torch.exp(changed - zt_new.unsqueeze(-1))
-            mine = torch.where(in_slab.unsqueeze(-1) & (torch.arange(lo, lo + slab, device=raw.device) == tgt.unsqueeze(-1)),
-                               0.0, mine)
-            loss = torch.log1p(others + mine.sum(-1)).view(n, b, t)
-            reward = torch.where(self.y.unsqueeze(0) != -1, clean.unsqueeze(0) - loss, 0)
-            if b > 1:
-                reward = reward - reward.mean(1, keepdim=True)
-            error[..., lo:lo + slab] -= torch.einsum(
-                'nbt,nbtd->btd', (reward / sigma).to(self.dtype), a.view(n, b, t, slab),
-            ).float()
+            error[..., lo:lo + slab] -= _head_chunk(
+                raw[..., lo:lo + slab], a, torch.tensor(lo, device=raw.device), torch.tensor(blk, device=raw.device),
+                tslab, target, z_t[..., 0], total_rel, slab_rel, clean, self.y, sigma, n)
         return error / (draws // slabs)
 
     def exact_head_error(self):

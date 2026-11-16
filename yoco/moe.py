@@ -53,7 +53,7 @@ class MoE(nn.Module):
         logits = capf(raw)
         est, prefix = self.dust if self.dust is not None else (None, None)
         if est is None or est.capturing:
-            self.logit_rms = raw.detach().square().mean().sqrt().item()
+            self.logit_rms = raw.detach().square().mean().sqrt()  # a tensor: read when logging, not per forward
         if est is not None and (prefix + 'moe' in est.jitter or prefix + 'gate' in est.jitter):
             ids = est.outputs[prefix + 'ids']  # draws at this layer's own sites keep the clean routing
             ids = ids.repeat(B // ids.shape[0], 1, 1)

@@ -163,6 +163,7 @@ def main():
     p.add_argument('--orth', nargs='*', default=[], help='orthogonal draws at sites ending with these (e.g. mlp.moe mlp.c_fc)')
     p.add_argument('--expert-probes', type=int, default=0, help='Dust MoE: expert hidden errors from N local probes against the layer output error (0: full draws)')
     p.add_argument('--moe-cv', action='store_true', help='with --moe-fix: control variate fitted per expert at the expert sites')
+    p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True, help='Dust: torch.compile the reruns and head draws')
     p.add_argument('--moe-layers', type=int, nargs='*', help='layers that get the MoE (default all)')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
@@ -385,7 +386,66 @@ def main():
         for n, p_ in model.named_parameters():
             p_.copy_(live[n])
         return v
+    # Speed diagnostics. DUST_TIME=N: time steps N .. N+4 per estimator phase (a sync around each call), print, exit.
+    # DUST_PROFILE=N: torch profiler on step N only (GPU kernels only, to keep host memory small), print, exit.
+    time_at, prof_at = int(os.environ.get('DUST_TIME', '0')), int(os.environ.get('DUST_PROFILE', '0'))
+    if args.compile and estimator is not None:
+        # Compile the model forward the reruns use (Dust's hooks make one graph per set of perturbed sites) and the
+        # head draws' elementwise chain. About 1.85x faster per step at 64 sequences on the RTX 5090, same results.
+        import torch._dynamo as dynamo_
+        from yoco import dustx as dustx_
+        dynamo_.config.cache_size_limit = 256
+        dynamo_.config.accumulated_cache_size_limit = 4096
+        if not args.moe:  # MoE's routing has data-dependent shapes (expert batch sizes): it would recompile every step
+            model.forward = torch.compile(model.forward, dynamic=False)
+        dustx_.COMPILE = True
+    phase = {}
+    if (time_at or prof_at) and estimator is not None:
+        from torch.profiler import record_function
+        for name_ in ('capture', 'losses', 'direct_errors', 'zo_self_local', 'zo_cross', 'head_error', 'finish', 'local_proj',
+                      'readout_loss', 'cv_predict', 'cv_update', 'cv_predict_moe', 'cv_update_moe', 'cv_key'):
+            if hasattr(estimator, name_):
+                def wrap(fn, label):
+                    def inner(*a, **kw):
+                        if not time_at:
+                            with record_function('dust.' + label):
+                                return fn(*a, **kw)
+                        torch.cuda.synchronize()
+                        t0 = time.monotonic()
+                        out = fn(*a, **kw)
+                        torch.cuda.synchronize()
+                        phase[label] = phase.get(label, 0.0) + time.monotonic() - t0
+                        return out
+                    return inner
+                setattr(estimator, name_, wrap(getattr(estimator, name_), name_))
+    prof = None
     for step in range(1, args.steps + 1):
+        if time_at and step == time_at:
+            torch.cuda.synchronize()
+            phase.clear()
+            t_prof = time.monotonic()
+        if time_at and step == time_at + 5:
+            torch.cuda.synchronize()
+            wall = (time.monotonic() - t_prof) / 5
+            print(f'TIME wall per step {wall:.3f}s  peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB', flush=True)
+            for k_, v_ in sorted(phase.items(), key=lambda kv: -kv[1]):
+                print(f'TIME {k_:16s} {v_ / 5:.3f}s/step  {100 * v_ / 5 / wall:.0f}%', flush=True)
+            return
+        if prof_at and step == prof_at:
+            from torch.profiler import ProfilerActivity, profile
+            torch.cuda.synchronize()
+            prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if os.environ.get('DUST_PROFILE_CPU')
+                           else [ProfilerActivity.CUDA])
+            prof.__enter__()
+        if prof is not None and step == prof_at + 1:
+            torch.cuda.synchronize()
+            prof.__exit__(None, None, None)
+            ka = prof.key_averages()
+            print(ka.table(sort_by='cuda_time_total', row_limit=40, max_name_column_width=70), flush=True)
+            if os.environ.get('DUST_PROFILE_CPU'):
+                for e_ in sorted([e_ for e_ in ka if e_.key.startswith('dust.')], key=lambda e_: -e_.device_time_total):
+                    print(f'PHASE {e_.key:24s} gpu {e_.device_time_total / 1e3:9.1f} ms  cpu {e_.cpu_time_total / 1e3:9.1f} ms  calls {e_.count}', flush=True)
+            return
         if args.wsd:
             f = min(1.0, (args.steps - step + 1) / (args.wsd * args.steps))
             for g, lr in zip(optimizer.param_groups, base_lr):
@@ -442,7 +502,7 @@ def main():
             rec['grad_norm'], rec['clipped'] = clip_state['norm'], clip_state['clipped']
             rec['grad_norm_part'] = clip_state.get('parts', {})
         if args.moe:
-            rec['router_rms'] = [round(m_.logit_rms, 3) for m_ in model.modules() if hasattr(m_, 'logit_rms')]
+            rec['router_rms'] = [round(float(m_.logit_rms), 3) for m_ in model.modules() if hasattr(m_, 'logit_rms')]
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
         high = high + 1 if loss > 10 else 0
         # diverged: a non-finite loss, the loss above 10 for 5 steps in a row (a single spike may recover), or the
@@ -465,7 +525,8 @@ def main():
                 rec['moe_load'] = moe_load
             if estimator is not None and estimator.cv_stats:
                 # share of reward variance the memory removed, per draw group
-                rec['cv_explained'] = {k: round(1 - b / a, 3) for k, (a, b) in estimator.cv_stats.items() if a > 0}
+                rec['cv_explained'] = {k: round(1 - float(b) / float(a), 3) for k, (a, b) in estimator.cv_stats.items()
+                                       if float(a) > 0}
                 estimator.cv_stats = {}
             if wema is not None and step >= 500:
                 rec['val_loss_ema'] = eval_ema()
