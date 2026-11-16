@@ -29,6 +29,7 @@ class MoE(nn.Module):
         self.register_buffer('load', torch.zeros(experts))  # tokens routed per expert, accumulated since last update
         self.dust = None
         self.cap = 0.0        # soft cap on router logits (0: off)
+        self.dense = False    # compute every expert for every token, keep the routed ones: fixed shapes, compilable
         self.logit_rms = 0.0  # size of the router logits in the last clean pass, for logging
 
     def init_weights(self):
@@ -68,6 +69,34 @@ class MoE(nn.Module):
         w = w / w.sum(-1, keepdim=True)
         xf = x.reshape(-1, d)
         N = xf.shape[0]
+        if self.dense:
+            # every expert on every token (E/k times the expert FLOPs), then keep each token's k routed slots: no sort,
+            # no padding, no host sync, fixed shapes. Same values as the sparse path below.
+            idx = ids.reshape(N, self.k, 1).expand(N, self.k, self.h)
+            pre = torch.einsum('nd,ehd->neh', xf, self.w_fc.to(x.dtype)).float().gather(1, idx).reshape(N * self.k, self.h)
+            if est is not None and prefix + 'moe' in est.jitter:
+                pre = pre + est.jitter[prefix + 'moe'].reshape(N * self.k, self.h).to(pre.dtype)
+            hid = F.relu(pre).square()
+            if est is not None and est.capturing:
+                est.outputs[prefix + 'ids'] = ids
+                est.outputs[prefix + 'moe'] = pre.view(B, T, self.k * self.h)
+                est.outputs[prefix + 'gate'] = sel
+                est.inputs[prefix + 'moe'] = xf.float()
+                est.inputs[prefix + 'hid'] = hid.float().view(N, self.k, self.h)
+                est.inputs[prefix + 'w'] = w.reshape(N, self.k)
+            H = torch.zeros(N, self.E, self.h, device=x.device, dtype=torch.float32)
+            H.scatter_(1, idx, hid.view(N, self.k, self.h) * w.reshape(N, self.k, 1))
+            out = torch.einsum('neh,edh->nd', H.to(x.dtype), self.w_proj.to(x.dtype)).float().view(B, T, d)
+        else:
+            out = self._sparse(x, xf, N, ids, w, sel, est, prefix).view(B, T, d)
+        if self.hs:
+            out = out + self.c_proj(F.relu(self.c_fc(x)).square()).float()
+        return out.to(x.dtype)
+
+
+    def _sparse(self, x, xf, N, ids, w, sel, est, prefix):
+        """Routed experts on padded per-expert batches (sorts the tokens; the largest batch is read back to the host)."""
+        B, T, d = x.shape
         flat_ids = ids.reshape(-1)                                    # [N*k], slot-major per token
         tok = torch.arange(N, device=x.device).repeat_interleave(self.k)
         # padded per-expert batches: slot i of the sorted list goes to (expert, rank within that expert)
@@ -96,10 +125,7 @@ class MoE(nn.Module):
         Y = torch.bmm(Hp, self.w_proj.to(x.dtype).transpose(1, 2))[eid, rank].float()   # [N*k, d] in sorted order
         out = torch.zeros(N, d, device=x.device, dtype=torch.float32)
         out.index_add_(0, tok[order], Y * w.reshape(-1)[order, None])
-        out = out.view(B, T, d)
-        if self.hs:
-            out = out + self.c_proj(F.relu(self.c_fc(x)).square()).float()
-        return out.to(x.dtype)
+        return out
 
     @torch.no_grad()
     def local_expert_errors(self, est, prefix, e_out, draws, sigma=0.2, n=8):

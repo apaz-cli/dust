@@ -58,7 +58,17 @@ def _head_chunk(*args):
     return _head_chunk_compiled(*args)
 
 
-COMPILE = False  # set by yoco/train.py (--compile): fuse the head draws' elementwise chain
+COMPILE = False  # set by yoco/train.py (--compile): fuse the head draws' and leak-free scoring's elementwise chains
+_compiled = {}
+
+
+def compiled(fn):
+    """fn itself, or its torch.compile'd version when COMPILE is set (compiled once, on first use)."""
+    if not COMPILE:
+        return fn
+    if fn not in _compiled:
+        _compiled[fn] = torch.compile(fn, dynamic=False)
+    return _compiled[fn]
 
 class DustX(DUST):
     def __init__(self, model, settings, seed=42, head='zo', local='zo', handoff=False, handoff_draws=None,
@@ -860,7 +870,7 @@ class DustX(DUST):
                               .view(n, b, t, h, d) - processed_f(k)[None])
                         if i not in sep_e:
                             sep_e[i] = (torch.einsum('buhd,bshd->bhus', eo, vf), torch.einsum('buhd,buhd->bhu', eo, of))
-                        score = self.separate_scores('k', P, eo, vf, of, credit, dk=dk, qp=qp.float(),
+                        score = compiled(DustX.separate_scores)('k', P, eo, vf, of, credit, dk=dk, qp=qp.float(),
                                                      ev=sep_e[i][0], eb=sep_e[i][1])
                     else:
                         if kind == 'gate':
@@ -871,7 +881,7 @@ class DustX(DUST):
                             dv = sigma * a.view(n, b, t, h, d)
                             if kind == 've':
                                 dv = dv * (2 * torch.sigmoid(z)).unsqueeze(-1)
-                        score = self.separate_scores(kind, P, eo, vf, of, credit, dv=dv.float())
+                        score = compiled(DustX.separate_scores)(kind, P, eo, vf, of, credit, dv=dv.float())
                     estimate = torch.einsum('nbth,nbthd->bthd', score, a.view(n, b, t, h, -1))
                     errors[i] += estimate.reshape(b, t, width) / divisor
                     continue
@@ -972,10 +982,10 @@ class DustX(DUST):
                 for i in cross:
                     P, eo, of, (ev, eb) = layer[i]
                     if kind == 'k':
-                        score = score + self.separate_scores('k', P, eo, vf, of, credit, dk=dk, qp=qp[i].float(),
+                        score = score + compiled(DustX.separate_scores)('k', P, eo, vf, of, credit, dk=dk, qp=qp[i].float(),
                                                              ev=ev, eb=eb)
                     else:
-                        score = score + self.separate_scores('v', P, eo, vf, of, credit,
+                        score = score + compiled(DustX.separate_scores)('v', P, eo, vf, of, credit,
                                                              dv=sigma * a.view(n, b, t, h, d))
                 err += torch.einsum('nbth,nbthd->bthd', score, a.view(n, b, t, h, d)).reshape(b, t, -1) / sigma
             return {f'transformer.cache_{kind}': err / draws}

@@ -164,6 +164,9 @@ def main():
     p.add_argument('--expert-probes', type=int, default=0, help='Dust MoE: expert hidden errors from N local probes against the layer output error (0: full draws)')
     p.add_argument('--moe-cv', action='store_true', help='with --moe-fix: control variate fitted per expert at the expert sites')
     p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True, help='Dust: torch.compile the reruns and head draws')
+    p.add_argument('--moe-dense', action='store_true', help='MoE: compute every expert for every token, keep the routed ones (fixed shapes: compiles)')
+    p.add_argument('--compile-backend', default='inductor', help='torch.compile backend for the model forward (diagnostics)')
+    p.add_argument('--nan-debug', action='store_true', help='print NaN counts of eager and compiled forwards on one batch, then exit')
     p.add_argument('--moe-layers', type=int, nargs='*', help='layers that get the MoE (default all)')
     p.add_argument('--n-layer', type=int, default=4)
     p.add_argument('--n-embd', type=int, default=256)
@@ -213,6 +216,7 @@ def main():
         for m_ in moe.install(model, E, k, h, hs, args.moe_layers):
             m_.rate = args.moe_balance_rate
             m_.cap = args.router_cap
+            m_.dense = args.moe_dense
         if args.method != 'dust':
             model.requires_grad_(False)  # build() leaves params frozen; the bp branch re-enables them below
     optimizer = make_optimizer(model, settings)
@@ -396,9 +400,48 @@ def main():
         from yoco import dustx as dustx_
         dynamo_.config.cache_size_limit = 256
         dynamo_.config.accumulated_cache_size_limit = 4096
-        if not args.moe:  # MoE's routing has data-dependent shapes (expert batch sizes): it would recompile every step
-            model.forward = torch.compile(model.forward, dynamic=False)
+        eager_forward = model.forward
+        if not args.moe or args.moe_dense:  # the sparse MoE path has data-dependent shapes: it would recompile every step
+            model.forward = torch.compile(model.forward, dynamic=False,
+                                          backend=args.compile_backend)
         dustx_.COMPILE = True
+        if model.forward is not eager_forward:
+            # Self-check: torch 2.11's compiled forward gives wrong per-token losses on reruns from block 0 (about 2e-2
+            # off, even with a zero perturbation; reruns from later blocks and torch 2.10 are fine). Compare one rerun
+            # from block 0 and one from block 1 against eager; if they disagree, rerun eagerly.
+            xc, yc = split(train[:args.microbatch_size or args.batch_seqs].to(device))
+            with torch.no_grad():
+                estimator.capture(xc, yc)
+                worst = 0.0
+                for site_, start_ in (('transformer.h.0.attn.c_proj', 0), ('transformer.h.1.attn.c_proj', 1)):
+                    estimator.jitter = {site_: torch.zeros_like(estimator.outputs[site_]).repeat(2, 1, 1)}
+                    estimator._start = start_
+                    xr, yr = xc.repeat(2, 1), yc.repeat(2, 1)
+                    got = estimator.losses(xr, yr)
+                    model.forward, compiled_forward = eager_forward, model.forward
+                    ref = estimator.losses(xr, yr)
+                    model.forward = compiled_forward
+                    worst = max(worst, (got - ref).abs().max().item())
+                estimator.jitter, estimator._start = {}, 0
+            print(f'compile self-check: max per-token loss difference {worst:.2e}', flush=True)
+            if worst > 1e-3:
+                print('compile self-check failed: the model forward runs eagerly (head draws stay compiled)', flush=True)
+                model.forward = eager_forward
+        if args.nan_debug:
+            # which forward modes give NaN, eager against compiled, on one batch (diagnosing the B300 NaN)
+            xd, yd = split(train[:args.microbatch_size or args.batch_seqs].to(device))
+            with torch.no_grad(), estimator.autocast():
+                for label_, fwd in (('eager', eager_forward), ('compiled', model.forward)):
+                    rec_ = {}
+                    full = fwd(xd, yd, loss_reduction='none', record=rec_).float()
+                    out_ = [f'{label_}: full {full.mean().item():.4f} nan {torch.isnan(full).sum().item()}']
+                    for st_ in range(1, config.n_layer):
+                        tr = fwd(xd, yd, loss_reduction='none', start=st_, state=rec_).float()
+                        out_.append(f'start{st_} {tr.mean().item():.4f} nan {torch.isnan(tr).sum().item()}')
+                    out_.append('record: ' + ' '.join(f'x{k_} nan {torch.isnan(v_).sum().item()}'
+                                                      for k_, v_ in rec_['x'].items()))
+                    print('NANDEBUG', ' | '.join(out_), flush=True)
+            return
     phase = {}
     if (time_at or prof_at) and estimator is not None:
         from torch.profiler import record_function
@@ -485,7 +528,8 @@ def main():
                     loss = estimator.step(x, y, optimizer)
                 if args.quant == 'sr':
                     quant.requantize(model, stochastic=True)
-            except FloatingPointError:
+            except FloatingPointError as e_:
+                print(f'step {step}: {e_}', flush=True)
                 loss = math.nan
         else:
             optimizer.zero_grad(set_to_none=True)
