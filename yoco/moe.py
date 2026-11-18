@@ -30,6 +30,7 @@ class MoE(nn.Module):
         self.dust = None
         self.cap = 0.0        # soft cap on router logits (0: off)
         self.dense = False    # compute every expert for every token, keep the routed ones: fixed shapes, compilable
+        self.grouped = False  # routed experts by one grouped matmul over the slots sorted by expert: fixed shapes, compilable
         self.logit_rms = 0.0  # size of the router logits in the last clean pass, for logging
 
     def init_weights(self):
@@ -61,7 +62,7 @@ class MoE(nn.Module):
         else:
             ids = (torch.sigmoid(logits) + self.balance_bias).topk(self.k, dim=-1).indices
             if est is None or est.capturing or not est.jitter:
-                self.load += torch.bincount(ids.flatten(), minlength=self.E).float()
+                self.load += self._counts(ids).float()
         sel = raw.gather(-1, ids)                                     # [B, T, k], before the cap: the gate site
         if est is not None and prefix + 'gate' in est.jitter:
             sel = sel + est.jitter[prefix + 'gate'].float()
@@ -87,12 +88,50 @@ class MoE(nn.Module):
             H = torch.zeros(N, self.E, self.h, device=x.device, dtype=torch.float32)
             H.scatter_(1, idx, hid.view(N, self.k, self.h) * w.reshape(N, self.k, 1))
             out = torch.einsum('neh,edh->nd', H.to(x.dtype), self.w_proj.to(x.dtype)).float().view(B, T, d)
+        elif self.grouped and self._mm_dtype(x) == torch.bfloat16:
+            out = self._grouped(x, xf, N, ids, w, sel, est, prefix).view(B, T, d)
         else:
             out = self._sparse(x, xf, N, ids, w, sel, est, prefix).view(B, T, d)
         if self.hs:
             out = out + self.c_proj(F.relu(self.c_fc(x)).square()).float()
         return out.to(x.dtype)
 
+
+    def _counts(self, ids):
+        """Tokens per expert, [E] int64; a fixed-size output (bincount's size depends on the data, which breaks compile)."""
+        flat = ids.reshape(-1)
+        return torch.zeros(self.E, dtype=torch.int64, device=ids.device).scatter_add_(0, flat, torch.ones_like(flat))
+
+    @staticmethod
+    def _mm_dtype(x):
+        return torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else x.dtype
+
+    def _grouped(self, x, xf, N, ids, w, sel, est, prefix):
+        """Routed experts as in _sparse, but with one grouped matmul per projection over the N*k token slots sorted by
+        expert (torch._grouped_mm, per-expert offsets on the device): no padding, no host sync, fixed shapes, so the
+        forward compiles. bf16 only (the autocast dtype)."""
+        B, T, d = x.shape
+        bf = torch.bfloat16
+        flat_ids = ids.reshape(-1)                                    # [N*k], slot-major per token
+        order = flat_ids.argsort(stable=True)
+        inv = order.argsort()
+        tok = order // self.k                                         # the token of each sorted slot
+        offs = torch.cumsum(self._counts(ids), 0).to(torch.int32)     # end of each expert's group
+        pre = torch._grouped_mm(xf[tok].to(bf), self.w_fc.to(bf).transpose(1, 2), offs=offs).float()[inv]
+        if est is not None and prefix + 'moe' in est.jitter:
+            pre = pre + est.jitter[prefix + 'moe'].reshape(N * self.k, self.h).to(pre.dtype)
+        hid = F.relu(pre).square()
+        if est is not None and est.capturing:
+            est.outputs[prefix + 'ids'] = ids
+            est.outputs[prefix + 'moe'] = pre.view(B, T, self.k * self.h)
+            est.outputs[prefix + 'gate'] = sel
+            est.inputs[prefix + 'moe'] = xf.float()
+            est.inputs[prefix + 'hid'] = hid.float().view(N, self.k, self.h)
+            est.inputs[prefix + 'w'] = w.reshape(N, self.k)
+        Y = torch._grouped_mm(hid[order].to(bf), self.w_proj.to(bf).transpose(1, 2), offs=offs).float()  # sorted order
+        out = torch.zeros(N, d, device=x.device, dtype=torch.float32)
+        out.index_add_(0, tok, Y * w.reshape(-1)[order, None])
+        return out
 
     def _sparse(self, x, xf, N, ids, w, sel, est, prefix):
         """Routed experts on padded per-expert batches (sorts the tokens; the largest batch is read back to the host)."""

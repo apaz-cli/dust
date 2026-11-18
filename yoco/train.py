@@ -164,6 +164,8 @@ def main():
     p.add_argument('--expert-probes', type=int, default=0, help='Dust MoE: expert hidden errors from N local probes against the layer output error (0: full draws)')
     p.add_argument('--moe-cv', action='store_true', help='with --moe-fix: control variate fitted per expert at the expert sites')
     p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True, help='Dust: torch.compile the reruns and head draws')
+    p.add_argument('--compile-force', action='store_true', help='keep the compiled forward even if the self-check fails')
+    p.add_argument('--moe-grouped', action='store_true', help='MoE: one grouped matmul over the slots sorted by expert (fixed shapes: compiles)')
     p.add_argument('--moe-dense', action='store_true', help='MoE: compute every expert for every token, keep the routed ones (fixed shapes: compiles)')
     p.add_argument('--compile-backend', default='inductor', help='torch.compile backend for the model forward (diagnostics)')
     p.add_argument('--nan-debug', action='store_true', help='print NaN counts of eager and compiled forwards on one batch, then exit')
@@ -217,6 +219,7 @@ def main():
             m_.rate = args.moe_balance_rate
             m_.cap = args.router_cap
             m_.dense = args.moe_dense
+            m_.grouped = args.moe_grouped
         if args.method != 'dust':
             model.requires_grad_(False)  # build() leaves params frozen; the bp branch re-enables them below
     optimizer = make_optimizer(model, settings)
@@ -401,7 +404,7 @@ def main():
         dynamo_.config.cache_size_limit = 256
         dynamo_.config.accumulated_cache_size_limit = 4096
         eager_forward = model.forward
-        if not args.moe or args.moe_dense:  # the sparse MoE path has data-dependent shapes: it would recompile every step
+        if not args.moe or args.moe_dense or args.moe_grouped:  # the sparse MoE path has data-dependent shapes: it would recompile every step
             model.forward = torch.compile(model.forward, dynamic=False,
                                           backend=args.compile_backend)
         dustx_.COMPILE = True
@@ -412,7 +415,7 @@ def main():
             xc, yc = split(train[:args.microbatch_size or args.batch_seqs].to(device))
             with torch.no_grad():
                 estimator.capture(xc, yc)
-                worst = 0.0
+                worst, diffs_ = 0.0, []
                 for site_, start_ in (('transformer.h.0.attn.c_proj', 0), ('transformer.h.1.attn.c_proj', 1)):
                     estimator.jitter = {site_: torch.zeros_like(estimator.outputs[site_]).repeat(2, 1, 1)}
                     estimator._start = start_
@@ -422,9 +425,14 @@ def main():
                     ref = estimator.losses(xr, yr)
                     model.forward = compiled_forward
                     worst = max(worst, (got - ref).abs().max().item())
+                    diffs_.append((got - ref).abs().flatten().float())
                 estimator.jitter, estimator._start = {}, 0
-            print(f'compile self-check: max per-token loss difference {worst:.2e}', flush=True)
-            if worst > 1e-3:
+            diffs_ = torch.cat(diffs_)
+            print(f'compile self-check: max per-token loss difference {worst:.2e}, mean {diffs_.mean().item():.2e}, '
+                  f'share over 1e-3 {(diffs_ > 1e-3).float().mean().item():.4f}', flush=True)
+            if worst > 1e-3 and args.compile_force:
+                print('compile self-check failed, kept compiled (--compile-force)', flush=True)
+            elif worst > 1e-3:
                 print('compile self-check failed: the model forward runs eagerly (head draws stay compiled)', flush=True)
                 model.forward = eager_forward
         if args.nan_debug:
