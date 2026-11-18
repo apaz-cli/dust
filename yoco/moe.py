@@ -90,7 +90,7 @@ class MoE(nn.Module):
             H = torch.zeros(N, self.E, self.h, device=x.device, dtype=torch.float32)
             H.scatter_(1, idx, hid.view(N, self.k, self.h) * w.reshape(N, self.k, 1))
             out = torch.einsum('neh,edh->nd', H.to(x.dtype), self.w_proj.to(x.dtype)).float().view(B, T, d)
-        elif self.grouped:
+        elif self.grouped and x.is_cuda and not (torch.is_grad_enabled() and self.w_fc.requires_grad):
             out = self._grouped(x, xf, N, ids, w, sel, est, prefix).view(B, T, d)
         else:
             out = self._sparse(x, xf, N, ids, w, sel, est, prefix).view(B, T, d)
@@ -110,17 +110,18 @@ class MoE(nn.Module):
 
     def _grouped(self, x, xf, N, ids, w, sel, est, prefix):
         """Routed experts as in _sparse, but with one grouped matmul per projection over the N*k token slots sorted by
-        expert (torch._grouped_mm, per-expert offsets on the device): no padding, no host sync, fixed shapes, so the
-        forward compiles. torch._grouped_mm takes bf16 only, so these two matmuls run in bf16 whatever the autocast
-        dtype (fast16 runs the rest in fp16); accumulation is fp32 either way."""
+        expert (yoco/gmm.py, a Triton kernel with the per-expert offsets on the device): no padding, no host sync,
+        fixed shapes, so the forward compiles. Inputs in the autocast dtype (fp16 under fast16), fp32 accumulation and
+        output. Forward only: training with gradients (backprop) takes _sparse."""
+        from yoco.gmm import gmm
         B, T, d = x.shape
-        bf = torch.bfloat16
+        dt = self._mm_dtype(x)
         flat_ids = ids.reshape(-1)                                    # [N*k], slot-major per token
         order = flat_ids.argsort(stable=True)
         inv = order.argsort()
         tok = order // self.k                                         # the token of each sorted slot
         offs = torch.cumsum(self._counts(ids), 0).to(torch.int32)     # end of each expert's group
-        pre = torch._grouped_mm(xf[tok].to(bf), self.w_fc.to(bf).transpose(1, 2), offs=offs).float()[inv]
+        pre = gmm(xf[tok].to(dt), self.w_fc.to(dt).transpose(1, 2), offs)[inv]
         if est is not None and prefix + 'moe' in est.jitter:
             pre = pre + est.jitter[prefix + 'moe'].reshape(N * self.k, self.h).to(pre.dtype)
         hid = F.relu(pre).square()
@@ -131,7 +132,7 @@ class MoE(nn.Module):
             est.inputs[prefix + 'moe'] = xf.float()
             est.inputs[prefix + 'hid'] = hid.float().view(N, self.k, self.h)
             est.inputs[prefix + 'w'] = w.reshape(N, self.k)
-        Y = torch._grouped_mm(hid[order].to(bf), self.w_proj.to(bf).transpose(1, 2), offs=offs).float()  # sorted order
+        Y = gmm(hid[order].to(dt), self.w_proj.to(dt).transpose(1, 2), offs)          # [N*k, d], sorted order
         out = torch.zeros(N, d, device=x.device, dtype=torch.float32)
         out.index_add_(0, tok, Y * w.reshape(-1)[order, None])
         return out

@@ -167,6 +167,17 @@ class DustX(DUST):
                     y = torch.mm(x.reshape(-1, x.shape[-1]).half(), W.half().t(), out_dtype=torch.float32)
                 return y.view(*x.shape[:-1], -1)
             head.forward = head_fwd
+            # The output projections write into the fp32 residual stream, so they return fp32 as well (fp16 inputs,
+            # fp32 accumulation as before). Rounded to fp16 they overflowed: under AdamW the first block's MLP output
+            # grows to about 6e4 (fp16 tops out at 65504) and a draw then made the estimate infinite (the 8-layer
+            # dense AdamW runs of fw_round2, near step 1000; yoco/diag_overflow.py).
+            for name, mod in self.model.named_modules():
+                if isinstance(mod, nn.Linear) and name.endswith('c_proj'):
+                    def proj_fwd(x, mod=mod):
+                        with torch.autocast('cuda', enabled=False):
+                            y = torch.mm(x.reshape(-1, x.shape[-1]).half(), mod.weight.half().t(), out_dtype=torch.float32)
+                        return y.view(*x.shape[:-1], -1)
+                    mod.forward = proj_fwd
         if mode in ('tf32', 'fast16'):
             self.model.transformer.wte.float()
             for ve in self.model.value_embeds.values():
