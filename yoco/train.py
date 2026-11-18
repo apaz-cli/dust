@@ -165,7 +165,9 @@ def main():
     p.add_argument('--moe-cv', action='store_true', help='with --moe-fix: control variate fitted per expert at the expert sites')
     p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True, help='Dust: torch.compile the reruns and head draws')
     p.add_argument('--compile-force', action='store_true', help='keep the compiled forward even if the self-check fails')
-    p.add_argument('--moe-grouped', action='store_true', help='MoE: one grouped matmul over the slots sorted by expert (fixed shapes: compiles)')
+    p.add_argument('--moe-grouped', action=argparse.BooleanOptionalAction, default=True,
+                   help='MoE: one grouped matmul over the slots sorted by expert (fixed shapes: compiles); '
+                        '--no-moe-grouped for the padded per-expert batches (host sync, runs eagerly)')
     p.add_argument('--moe-dense', action='store_true', help='MoE: compute every expert for every token, keep the routed ones (fixed shapes: compiles)')
     p.add_argument('--compile-backend', default='inductor', help='torch.compile backend for the model forward (diagnostics)')
     p.add_argument('--nan-debug', action='store_true', help='print NaN counts of eager and compiled forwards on one batch, then exit')
