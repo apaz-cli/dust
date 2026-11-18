@@ -56,13 +56,15 @@ class MoE(nn.Module):
         est, prefix = self.dust if self.dust is not None else (None, None)
         if est is None or est.capturing:
             self.logit_rms = raw.detach().square().mean().sqrt()  # a tensor: read when logging, not per forward
-        if est is not None and (prefix + 'moe' in est.jitter or prefix + 'gate' in est.jitter):
+        if est is not None and (prefix + 'moe' in est.jitter or prefix + 'gate' in est.jitter
+                                or (getattr(est, 'pin_routing', False) and not est.capturing)):
             ids = est.outputs[prefix + 'ids']  # draws at this layer's own sites keep the clean routing
             ids = ids.repeat(B // ids.shape[0], 1, 1)
         else:
             ids = (torch.sigmoid(logits) + self.balance_bias).topk(self.k, dim=-1).indices
             if est is None or est.capturing or not est.jitter:
                 self.load += self._counts(ids).float()
+        self.last_ids = ids
         sel = raw.gather(-1, ids)                                     # [B, T, k], before the cap: the gate site
         if est is not None and prefix + 'gate' in est.jitter:
             sel = sel + est.jitter[prefix + 'gate'].float()
@@ -88,7 +90,7 @@ class MoE(nn.Module):
             H = torch.zeros(N, self.E, self.h, device=x.device, dtype=torch.float32)
             H.scatter_(1, idx, hid.view(N, self.k, self.h) * w.reshape(N, self.k, 1))
             out = torch.einsum('neh,edh->nd', H.to(x.dtype), self.w_proj.to(x.dtype)).float().view(B, T, d)
-        elif self.grouped and self._mm_dtype(x) == torch.bfloat16:
+        elif self.grouped:
             out = self._grouped(x, xf, N, ids, w, sel, est, prefix).view(B, T, d)
         else:
             out = self._sparse(x, xf, N, ids, w, sel, est, prefix).view(B, T, d)
@@ -109,7 +111,8 @@ class MoE(nn.Module):
     def _grouped(self, x, xf, N, ids, w, sel, est, prefix):
         """Routed experts as in _sparse, but with one grouped matmul per projection over the N*k token slots sorted by
         expert (torch._grouped_mm, per-expert offsets on the device): no padding, no host sync, fixed shapes, so the
-        forward compiles. bf16 only (the autocast dtype)."""
+        forward compiles. torch._grouped_mm takes bf16 only, so these two matmuls run in bf16 whatever the autocast
+        dtype (fast16 runs the rest in fp16); accumulation is fp32 either way."""
         B, T, d = x.shape
         bf = torch.bfloat16
         flat_ids = ids.reshape(-1)                                    # [N*k], slot-major per token

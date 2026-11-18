@@ -416,17 +416,34 @@ def main():
             with torch.no_grad():
                 estimator.capture(xc, yc)
                 worst, diffs_ = 0.0, []
-                for site_, start_ in (('transformer.h.0.attn.c_proj', 0), ('transformer.h.1.attn.c_proj', 1)):
-                    estimator.jitter = {site_: torch.zeros_like(estimator.outputs[site_]).repeat(2, 1, 1)}
-                    estimator._start = start_
-                    xr, yr = xc.repeat(2, 1), yc.repeat(2, 1)
-                    got = estimator.losses(xr, yr)
-                    model.forward, compiled_forward = eager_forward, model.forward
-                    ref = estimator.losses(xr, yr)
-                    model.forward = compiled_forward
-                    worst = max(worst, (got - ref).abs().max().item())
-                    diffs_.append((got - ref).abs().flatten().float())
-                estimator.jitter, estimator._start = {}, 0
+                moes_ = [m_ for m_ in model.modules() if hasattr(m_, 'last_ids')] if args.moe else []
+                flips_ = []
+                # MoE: routing is a discrete choice, so tiny rounding differences between the compiled and eager
+                # forwards flip a few near-tied tokens to another expert (logged as the share of flipped slots).
+                # The check itself compares the arithmetic with the routing pinned to the clean pass's.
+                for pin_ in ((False, True) if moes_ else (False,)):
+                    estimator.pin_routing = pin_
+                    for site_, start_ in (('transformer.h.0.attn.c_proj', 0), ('transformer.h.1.attn.c_proj', 1)):
+                        estimator.jitter = {site_: torch.zeros_like(estimator.outputs[site_]).repeat(2, 1, 1)}
+                        estimator._start = start_
+                        xr, yr = xc.repeat(2, 1), yc.repeat(2, 1)
+                        got = estimator.losses(xr, yr)
+                        ids_c = [m_.last_ids.clone() for m_ in moes_ if m_.last_ids.shape[0] == xr.shape[0]]
+                        model.forward, compiled_forward = eager_forward, model.forward
+                        ref = estimator.losses(xr, yr)
+                        ids_e = [m_.last_ids.clone() for m_ in moes_ if m_.last_ids.shape[0] == xr.shape[0]]
+                        model.forward = compiled_forward
+                        if pin_ or not moes_:
+                            worst = max(worst, (got - ref).abs().max().item())
+                            diffs_.append((got - ref).abs().flatten().float())
+                        else:
+                            unp_ = (got - ref).abs().max().item()
+                            flips_ += [(a_.sort(-1).values != b_.sort(-1).values).any(-1).float().mean().item()
+                                       for a_, b_ in zip(ids_c, ids_e)]
+                            print(f'compile self-check, routing free (start {start_}): max per-token loss difference '
+                                  f'{unp_:.2e}; share of tokens routed differently per MoE layer '
+                                  f'{[round(f_, 4) for f_ in flips_[-len(ids_c):]]}', flush=True)
+                estimator.jitter, estimator._start, estimator.pin_routing = {}, 0, False
             diffs_ = torch.cat(diffs_)
             print(f'compile self-check: max per-token loss difference {worst:.2e}, mean {diffs_.mean().item():.2e}, '
                   f'share over 1e-3 {(diffs_ > 1e-3).float().mean().item():.4f}', flush=True)
