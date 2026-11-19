@@ -32,6 +32,8 @@ class MoE(nn.Module):
         self.dense = False    # compute every expert for every token, keep the routed ones: fixed shapes, compilable
         self.grouped = False  # routed experts by one grouped matmul over the slots sorted by expert: fixed shapes, compilable
         self.logit_rms = 0.0  # size of the router logits in the last clean pass, for logging
+        self.margin = 0.0     # clean pass: mean gap between the k-th and (k+1)-th selection score (near 0: near-ties)
+        self.saturated = 0.0  # clean pass: share of chosen gate scores near the ceiling (sigmoid of 0.9 cap; 0.95 uncapped)
 
     def init_weights(self):
         d = self.w_fc.shape[-1]
@@ -69,6 +71,13 @@ class MoE(nn.Module):
         if est is not None and prefix + 'gate' in est.jitter:
             sel = sel + est.jitter[prefix + 'gate'].float()
         w = torch.sigmoid(capf(sel))
+        if est is None or est.capturing:  # routing diagnostics, tensors read only when logging
+            with torch.no_grad():
+                if self.k < self.E:
+                    top = (torch.sigmoid(logits) + self.balance_bias).topk(self.k + 1, dim=-1).values
+                    self.margin = (top[..., self.k - 1] - top[..., self.k]).mean()
+                ceil = 1 / (1 + math.exp(-0.9 * self.cap)) if self.cap else 0.95
+                self.saturated = (w.detach() > ceil).float().mean()
         w = w / w.sum(-1, keepdim=True)
         xf = x.reshape(-1, d)
         N = xf.shape[0]
@@ -256,6 +265,29 @@ def balance(model):
     for m in model.modules():
         if isinstance(m, MoE):
             m.update_balance()
+
+
+def router_stats(model):
+    """Per MoE layer, from the tokens routed since the last balance call (call before balance): experts that got
+    any token, the effective number of experts (exp of the entropy of the load: E when balanced, k when the same k
+    experts take every token), the busiest expert's load over the mean, the share of chosen gate scores
+    near their ceiling, the gap between the k-th and (k+1)-th selection score, the balance bias's size and spread,
+    and the router logits' size. Keys l<layer>/<name>."""
+    out = {}
+    for name, m in model.named_modules():
+        if not isinstance(m, MoE):
+            continue
+        layer = name.split('.')[2] if name.startswith('transformer.h.') else name
+        L = m.load.float()
+        p = L / L.sum().clamp(min=1)
+        H = -(p * p.clamp(min=1e-12).log()).sum()
+        b = m.balance_bias.float()
+        out.update({f'l{layer}/experts_used': float((L > 0).sum()), f'l{layer}/effective_experts': float(H.exp()),
+                    f'l{layer}/load_max': float(L.max() / L.mean().clamp(min=1)),
+                    f'l{layer}/saturated': float(m.saturated), f'l{layer}/margin': float(m.margin),
+                    f'l{layer}/bias_rms': float(b.square().mean().sqrt()), f'l{layer}/bias_spread': float(b.max() - b.min()),
+                    f'l{layer}/logit_rms': float(m.logit_rms)})
+    return out
 
 
 def load_stats(model):

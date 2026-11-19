@@ -567,6 +567,12 @@ def main():
             loss = l.item()
         if args.moe:
             moe_load = moe.load_stats(model)
+            # routing diagnostics: every 10 steps for the first 300 (router collapse under AdamW starts before step
+            # 100), then at every evaluation
+            if (step <= 300 and step % 10 == 0) or step == 1 or step % args.eval_every == 0 or step == args.steps:
+                router_ = moe.router_stats(model)
+            else:
+                router_ = None
             moe.balance(model)
         rec = dict(step=step, train_loss=loss, seconds=round(time.monotonic() - start, 1))
         if args.clip:
@@ -574,6 +580,8 @@ def main():
             rec['grad_norm_part'] = clip_state.get('parts', {})
         if args.moe:
             rec['router_rms'] = [round(float(m_.logit_rms), 3) for m_ in model.modules() if hasattr(m_, 'logit_rms')]
+            if router_ is not None:
+                rec['router'] = {k_: round(v_, 4) for k_, v_ in router_.items()}
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
         high = high + 1 if loss > 10 else 0
         # diverged: a non-finite loss, the loss above 10 for 5 steps in a row (a single spike may recover), or the
