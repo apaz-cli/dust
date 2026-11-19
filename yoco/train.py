@@ -179,6 +179,7 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--eval-every', type=int, default=100)
     p.add_argument('--save-at', type=int, nargs='*', default=[])
+    p.add_argument('--save-every', type=int, default=500, help='also save the weights every N steps (0: off), for replaying a run')
     p.add_argument('--data-dir', type=Path, default=Path('data/tinystories'))
     p.add_argument('--output', type=Path, help='run folder (default: $MLSWEEP_RUN_DIR under mlsweep)')
     args = p.parse_args()
@@ -333,7 +334,7 @@ def main():
     logger = MLSweepLogger()
     (args.output / 'config.json').write_text(json.dumps(dict(
         args={k: str(v) for k, v in vars(args).items()}, model=asdict(config), recipe=asdict(settings),
-        n_params=sum(q.numel() for q in model.parameters())), indent=1) + '\n')
+        n_params=sum(q.numel() for q in model.parameters()), code=code_version()), indent=1) + '\n')
 
     def save(step):
         torch.save({k: v.cpu() for k, v in model.state_dict().items()}, args.output / f'step{step}.pt')
@@ -346,6 +347,15 @@ def main():
     high = 0  # consecutive steps with training loss above 10
     base_lr = [g['lr'] for g in optimizer.param_groups]
     clip_state = dict(avg=None, norm=0.0, clipped=0.0, steps=0)
+
+    def part(n_):  # which part of the model a parameter belongs to, for the per-part logging
+        for key, name_ in (('mlp.router', 'router'), ('mlp.w_', 'experts'), ('.mlp.', 'mlp'), ('.attn.', 'attn'),
+                           ('cache_', 'cache'), ('wte', 'embedding'), ('value_embeds', 'value_embeds'),
+                           ('lm_head', 'head')):
+            if key in n_:
+                return name_
+        return 'other'
+    parts = [(part(n_), p_) for n_, p_ in model.named_parameters()]
     if args.clip:
         # Wrap the optimizer's step so every path (Dust, microbatches, backprop) is clipped the same way. The limit is
         # CLIP times an average of recent (clipped) gradient norms; the first 20 steps only build the average.
@@ -354,15 +364,6 @@ def main():
         # unchanged everywhere (the idea is not new; AutoClip, Seetharaman et al. 2020, clips at a percentile of
         # recent norms).
         raw_step = optimizer.step
-
-        def part(n_):  # which part of the model a parameter belongs to, for the per-part gradient norms
-            for key, name_ in (('mlp.router', 'router'), ('mlp.w_', 'experts'), ('.mlp.', 'mlp'), ('.attn.', 'attn'),
-                               ('cache_', 'cache'), ('wte', 'embedding'), ('value_embeds', 'value_embeds'),
-                               ('lm_head', 'head')):
-                if key in n_:
-                    return name_
-            return 'other'
-        parts = [(part(n_), p_) for n_, p_ in model.named_parameters()]
 
         def clipped_step(*a, **kw):
             grads = [p_.grad for p_ in model.parameters() if p_.grad is not None]
@@ -398,6 +399,7 @@ def main():
     # Speed diagnostics. DUST_TIME=N: time steps N .. N+4 per estimator phase (a sync around each call), print, exit.
     # DUST_PROFILE=N: torch profiler on step N only (GPU kernels only, to keep host memory small), print, exit.
     time_at, prof_at = int(os.environ.get('DUST_TIME', '0')), int(os.environ.get('DUST_PROFILE', '0'))
+    plain_forward = model.forward
     if args.compile and estimator is not None:
         # Compile the model forward the reruns use (Dust's hooks make one graph per set of perturbed sites) and the
         # head draws' elementwise chain. About 1.85x faster per step at 64 sequences on the RTX 5090, same results.
@@ -529,6 +531,9 @@ def main():
                                          hidden=[r_(v) for v in settings.hidden], hubs=[r_(v) for v in settings.hubs],
                                          embedding=r_(settings.embedding),
                                          local={kk: r_(v) for kk, v in settings.local.items()})
+        # diagnostic steps: every 10 for the first 300, then at every evaluation
+        diag = (step <= 300 and step % 10 == 0) or step == 1 or step % args.eval_every == 0 or step == args.steps
+        before = {n_: p_.detach().clone() for n_, p_ in model.named_parameters()} if diag else None
         start_ = (step - 1) * args.batch_seqs % len(train)  # wrap around: another pass over the data
         batch = train[start_:start_ + args.batch_seqs]
         if len(batch) < args.batch_seqs:
@@ -569,7 +574,7 @@ def main():
             moe_load = moe.load_stats(model)
             # routing diagnostics: every 10 steps for the first 300 (router collapse under AdamW starts before step
             # 100), then at every evaluation
-            if (step <= 300 and step % 10 == 0) or step == 1 or step % args.eval_every == 0 or step == args.steps:
+            if diag:
                 router_ = moe.router_stats(model)
             else:
                 router_ = None
@@ -582,6 +587,10 @@ def main():
             rec['router_rms'] = [round(float(m_.logit_rms), 3) for m_ in model.modules() if hasattr(m_, 'logit_rms')]
             if router_ is not None:
                 rec['router'] = {k_: round(v_, 4) for k_, v_ in router_.items()}
+        if step == 1:
+            rec['compiled'] = float(model.forward is not plain_forward)  # 0 if compile was off or the self-check failed
+        if diag:
+            rec.update(diagnostics(model, parts, before, optimizer, estimator, part))
         ema = loss if ema is None else 0.9 * ema + 0.1 * loss
         high = high + 1 if loss > 10 else 0
         # diverged: a non-finite loss, the loss above 10 for 5 steps in a row (a single spike may recover), or the
@@ -610,7 +619,7 @@ def main():
             if wema is not None and step >= 500:
                 rec['val_loss_ema'] = eval_ema()
             print(json.dumps(rec), flush=True)
-        if step in args.save_at:
+        if step in args.save_at or (args.save_every and step % args.save_every == 0 and step != args.steps):
             save(step)
         log.write(json.dumps(rec) + '\n')
         log.flush()
@@ -622,6 +631,62 @@ def main():
         logger.log({'val_first_half': first, 'val_second_half': second}, step=rec['step'])
         print(json.dumps(dict(val_first_half=first, val_second_half=second)), flush=True)
     logger.close()
+
+
+def code_version():
+    """The code a run used: the git commit and whether the tree had changes (when .git is there), and a hash of the
+    Python sources, which is there either way (mlsweep may upload the code without .git)."""
+    import hashlib
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    h = hashlib.sha1()
+    for f in sorted(list(root.glob('*.py')) + list((root / 'yoco').glob('*.py'))):
+        h.update(f.name.encode())
+        h.update(f.read_bytes())
+    out = dict(sources_sha1=h.hexdigest()[:12])
+    try:
+        out['git'] = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=root, capture_output=True, text=True,
+                                    timeout=10).stdout.strip() or None
+        out['git_dirty'] = bool(subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=root,
+                                               capture_output=True, text=True, timeout=10).stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
+
+
+@torch.no_grad()
+def diagnostics(model, parts, before, optimizer, estimator, part):
+    """Cheap per-part numbers for post-hoc debugging: weight norm, this step's update relative to it, AdamW's mean
+    |m|/sqrt(v) (bias-corrected; near 1 means full-size steps on a consistent signal, near 0 mostly noise), and the
+    largest clean-pass activation at Dust's sites (fp16 overflows at 65504)."""
+    wn, dn, adam, cnt = {}, {}, {}, {}
+    state = getattr(optimizer, 'state', {})
+    group_of = {id(q): g for g in getattr(optimizer, 'param_groups', []) for q in g['params']}
+    for (k_, p_), (n_, _) in zip(parts, model.named_parameters()):
+        w = p_.detach().float()
+        wn[k_] = wn.get(k_, 0.0) + w.square().sum()
+        dn[k_] = dn.get(k_, 0.0) + (w - before[n_].float()).square().sum()
+        st = state.get(p_, {})
+        if 'exp_avg' in st and 'exp_avg_sq' in st:
+            g = group_of.get(id(p_), {})
+            b1, b2 = g.get('betas', (0.9, 0.999))
+            t = float(st['step']) if 'step' in st else 1.0
+            m = st['exp_avg'].float() / (1 - b1 ** t)
+            v = st['exp_avg_sq'].float() / (1 - b2 ** t)
+            adam[k_] = adam.get(k_, 0.0) + (m.abs() / (v.sqrt() + g.get('eps', 1e-8))).sum()
+            cnt[k_] = cnt.get(k_, 0) + p_.numel()
+    out = {'weight_norm': {k_: round(float(v_.sqrt()), 4) for k_, v_ in wn.items()},
+           'update_ratio': {k_: float(dn[k_].sqrt() / wn[k_].sqrt().clamp(min=1e-12)) for k_ in wn}}
+    if adam:
+        out['adam_snr'] = {k_: round(float(adam[k_]) / cnt[k_], 4) for k_ in adam}
+    if estimator is not None and getattr(estimator, 'outputs', None):
+        peak = {}
+        for site, o in estimator.outputs.items():
+            if torch.is_tensor(o) and o.is_floating_point() and o.dim() >= 2:
+                k_ = part(site)
+                peak[k_] = max(peak.get(k_, 0.0), float(o.detach().abs().max()))
+        out['act_peak'] = {k_: round(v_, 1) for k_, v_ in peak.items()}
+    return out
 
 
 def scalars(rec):
