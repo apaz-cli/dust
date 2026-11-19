@@ -182,6 +182,9 @@ def main():
     p.add_argument('--count-flops', action='store_true',
                    help='count the floating-point operations of step 2 (run uncompiled) and of one forward pass; '
                         'logged as flops_per_token, flops_forward_per_token, flops_ratio; breakdown in flops.json')
+    p.add_argument('--noise-probe-every', type=int, default=0,
+                   help='every N steps (and every step of --diag-window), measure the noise and bias of Dust\'s '
+                        'estimate per site and per weight against exact references (yoco/noise_probe.py; 0: off)')
     p.add_argument('--diag-window', type=int, nargs=2, default=None, metavar=('FIRST', 'LAST'),
                    help='also log the per-part and routing diagnostics at every step from FIRST to LAST')
     p.add_argument('--save-every', type=int, default=500, help='also save the weights every N steps (0: off), for replaying a run')
@@ -548,6 +551,9 @@ def main():
             model.forward, dustx_c.COMPILE = plain_forward, False
             flop_ctx = flops_.FlopCounterMode(display=False, depth=4)
             flop_ctx.__enter__()
+        if estimator is not None and args.noise_probe_every and (step % args.noise_probe_every == 0 or (
+                args.diag_window and args.diag_window[0] <= step <= args.diag_window[1])):
+            estimator.noise_probe = True  # measured on this step's first microbatch, inside the estimator
         start_ = (step - 1) * args.batch_seqs % len(train)  # wrap around: another pass over the data
         batch = train[start_:start_ + args.batch_seqs]
         if len(batch) < args.batch_seqs:
@@ -618,6 +624,9 @@ def main():
                 rec['router'] = {k_: round(v_, 4) for k_, v_ in router_.items()}
         if flop_rec:
             rec.update(flop_rec)
+        if estimator is not None and getattr(estimator, 'probe_result', None):
+            rec.update(estimator.probe_result)
+            estimator.probe_result = None
         if step == 1:
             rec['compiled'] = float(model.forward is not plain_forward)  # 0 if compile was off or the self-check failed
         if diag:

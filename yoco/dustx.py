@@ -1352,6 +1352,10 @@ class DustX(DUST):
         else:
             errors['lm_head'] = self.head_error(r.head)
 
+        probing = getattr(self, 'noise_probe', False)
+        if probing:  # yoco/noise_probe.py: keep this microbatch's estimates to compare with exact references
+            self._probe = dict(x=x, y=y, errors={s: e.detach().float().clone() for s, e in errors.items()
+                                                 if torch.is_tensor(e)})
         for q in self.moe_prefixes:
             if self.expert_probes:  # the experts' hidden errors from local probes against the layer output's error
                 errors[q + 'moe'] = self.modules_moe[q].local_expert_errors(self, q, errors[q + 'c_proj'],
@@ -1361,6 +1365,11 @@ class DustX(DUST):
         for site, error in errors.items():
             grads[site + '.weight'] = self.reassemble(site, error)
         grads.update(self.scalar_gradients(8))
+        if probing:  # measured before any update, on the same weights the estimates were made at
+            from yoco import noise_probe
+            self._probe['grads'] = {n: g.detach().float().clone() for n, g in grads.items()}
+            self.probe_result = noise_probe.measure(self.model, self)
+            self.noise_probe, self._probe = False, None
         if self.oracle or self.oracle_re:
             grads.update(self.expected_grads(x, y))
 

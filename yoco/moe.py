@@ -29,6 +29,7 @@ class MoE(nn.Module):
         self.register_buffer('load', torch.zeros(experts))  # tokens routed per expert, accumulated since last update
         self.dust = None
         self.cap = 0.0        # soft cap on router logits (0: off)
+        self.probe = None     # yoco/noise_probe.py: a dict that receives the pre-activations and gate logits to keep grads of
         self.dense = False    # compute every expert for every token, keep the routed ones: fixed shapes, compilable
         self.grouped = False  # routed experts by one grouped matmul over the slots sorted by expert: fixed shapes, compilable
         self.logit_rms = 0.0  # size of the router logits in the last clean pass, for logging
@@ -68,6 +69,9 @@ class MoE(nn.Module):
                 self.load += self._counts(ids).float()
         self.last_ids = ids
         sel = raw.gather(-1, ids)                                     # [B, T, k], before the cap: the gate site
+        if self.probe is not None and sel.requires_grad:
+            sel.retain_grad()
+            self.probe['gate'] = sel
         if est is not None and prefix + 'gate' in est.jitter:
             sel = sel + est.jitter[prefix + 'gate'].float()
         w = torch.sigmoid(capf(sel))
@@ -164,6 +168,9 @@ class MoE(nn.Module):
         pre[order] = torch.bmm(Xp, self.w_fc.to(x.dtype).transpose(1, 2))[eid, rank].float()
         if est is not None and prefix + 'moe' in est.jitter:
             pre = pre + est.jitter[prefix + 'moe'].reshape(N * self.k, self.h).to(pre.dtype)
+        if self.probe is not None and pre.requires_grad:
+            pre.retain_grad()
+            self.probe['moe'] = pre
         hid = F.relu(pre).square()
         if est is not None and est.capturing:
             est.outputs[prefix + 'ids'] = ids
