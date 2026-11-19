@@ -179,6 +179,9 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--eval-every', type=int, default=100)
     p.add_argument('--save-at', type=int, nargs='*', default=[])
+    p.add_argument('--count-flops', action='store_true',
+                   help='count the floating-point operations of step 2 (run uncompiled) and of one forward pass; '
+                        'logged as flops_per_token, flops_forward_per_token, flops_ratio; breakdown in flops.json')
     p.add_argument('--diag-window', type=int, nargs=2, default=None, metavar=('FIRST', 'LAST'),
                    help='also log the per-part and routing diagnostics at every step from FIRST to LAST')
     p.add_argument('--save-every', type=int, default=500, help='also save the weights every N steps (0: off), for replaying a run')
@@ -537,6 +540,14 @@ def main():
         diag = (step <= 300 and step % 10 == 0) or step == 1 or step % args.eval_every == 0 or step == args.steps \
             or (args.diag_window and args.diag_window[0] <= step <= args.diag_window[1])
         before = {n_: p_.detach().clone() for n_, p_ in model.named_parameters()} if diag else None
+        flop_ctx = None
+        if args.count_flops and step == 2:  # step 1 includes compilation and warm-ups; count the next one, uncompiled
+            from yoco import flops as flops_
+            from yoco import dustx as dustx_c
+            flop_restore = (model.forward, dustx_c.COMPILE)
+            model.forward, dustx_c.COMPILE = plain_forward, False
+            flop_ctx = flops_.FlopCounterMode(display=False, depth=4)
+            flop_ctx.__enter__()
         start_ = (step - 1) * args.batch_seqs % len(train)  # wrap around: another pass over the data
         batch = train[start_:start_ + args.batch_seqs]
         if len(batch) < args.batch_seqs:
@@ -573,6 +584,21 @@ def main():
             l.backward()
             optimizer.step()
             loss = l.item()
+        if flop_ctx is not None:
+            flop_ctx.__exit__(None, None, None)
+            ntok = int(x.numel())
+            fwd = flops_.forward_flops(model, x[:args.microbatch_size or len(x)], y[:args.microbatch_size or len(y)])
+            fwd_tok = fwd / int(x[:args.microbatch_size or len(x)].numel())
+            total = flop_ctx.get_total_flops()
+            flop_rec = dict(flops_per_token=total / ntok, flops_forward_per_token=fwd_tok,
+                            flops_ratio=total / ntok / fwd_tok)
+            (args.output / 'flops.json').write_text(json.dumps(dict(
+                step=step, tokens=ntok, total=total, forward_per_token=fwd_tok, **flop_rec,
+                breakdown=flops_._breakdown(flop_ctx)), indent=1) + '\n')
+            print('flops: ' + json.dumps(flop_rec), flush=True)
+            model.forward, dustx_c.COMPILE = flop_restore
+        else:
+            flop_rec = None
         if args.moe:
             moe_load = moe.load_stats(model)
             # routing diagnostics: every 10 steps for the first 300 (router collapse under AdamW starts before step
@@ -590,6 +616,8 @@ def main():
             rec['router_rms'] = [round(float(m_.logit_rms), 3) for m_ in model.modules() if hasattr(m_, 'logit_rms')]
             if router_ is not None:
                 rec['router'] = {k_: round(v_, 4) for k_, v_ in router_.items()}
+        if flop_rec:
+            rec.update(flop_rec)
         if step == 1:
             rec['compiled'] = float(model.forward is not plain_forward)  # 0 if compile was off or the self-check failed
         if diag:
