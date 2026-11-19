@@ -9,7 +9,11 @@
 # - Backprop AdamW at the same batches and rates, for backprop's critical batch size.
 # - Dust SGD with every draw count doubled (--direct-scale 2, local draws x8) at 64 and 128 sequences: total draws
 #   against batch, at about the cost of the next batch size up.
-from _common import LEAKFREE_CV, PY, UPLOAD_EXCLUDE  # noqa: F401
+from _common import LEAKFREE_CV, PY, UPLOAD_EXCLUDE as _EX  # noqa: F401
+
+# only fineweb-edu is needed; the package must stay under mlsweep's 512 MB upload limit
+UPLOAD_EXCLUDE = _EX + ["/ckpt", "/data/tinystories", "/data/tinystories_long", "/data/tsrepeat", "/data/tsrepeat2048",
+                       "/data/tsrepeat8192"]
 
 FW = ["--data-dir", "data/fineweb_edu", "--n-layer", "4", "--n-embd", "512", "--steps", "1500", "--save-every", "0"]
 COMMAND = [PY, "yoco/train.py", "--arch", "yoco", "--seed", "42"] + FW
