@@ -179,6 +179,8 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--eval-every', type=int, default=100)
     p.add_argument('--save-at', type=int, nargs='*', default=[])
+    p.add_argument('--diag-window', type=int, nargs=2, default=None, metavar=('FIRST', 'LAST'),
+                   help='also log the per-part and routing diagnostics at every step from FIRST to LAST')
     p.add_argument('--save-every', type=int, default=500, help='also save the weights every N steps (0: off), for replaying a run')
     p.add_argument('--data-dir', type=Path, default=Path('data/tinystories'))
     p.add_argument('--output', type=Path, help='run folder (default: $MLSWEEP_RUN_DIR under mlsweep)')
@@ -532,7 +534,8 @@ def main():
                                          embedding=r_(settings.embedding),
                                          local={kk: r_(v) for kk, v in settings.local.items()})
         # diagnostic steps: every 10 for the first 300, then at every evaluation
-        diag = (step <= 300 and step % 10 == 0) or step == 1 or step % args.eval_every == 0 or step == args.steps
+        diag = (step <= 300 and step % 10 == 0) or step == 1 or step % args.eval_every == 0 or step == args.steps \
+            or (args.diag_window and args.diag_window[0] <= step <= args.diag_window[1])
         before = {n_: p_.detach().clone() for n_, p_ in model.named_parameters()} if diag else None
         start_ = (step - 1) * args.batch_seqs % len(train)  # wrap around: another pass over the data
         batch = train[start_:start_ + args.batch_seqs]
