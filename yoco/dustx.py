@@ -175,6 +175,10 @@ class DustX(DUST):
                 if isinstance(mod, nn.Linear) and name.endswith('c_proj'):
                     def proj_fwd(x, mod=mod):
                         with torch.autocast('cuda', enabled=False):
+                            if torch.is_grad_enabled() and (x.requires_grad or mod.weight.requires_grad):
+                                # a measuring pass with derivatives (oracles, noise probes): the fp32-output mm
+                                # has no autograd rule, so plain fp32
+                                return F.linear(x.float(), mod.weight.float())
                             y = torch.mm(x.reshape(-1, x.shape[-1]).half(), mod.weight.half().t(), out_dtype=torch.float32)
                         return y.view(*x.shape[:-1], -1)
                     mod.forward = proj_fwd
