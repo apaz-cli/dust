@@ -179,6 +179,10 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--eval-every', type=int, default=100)
     p.add_argument('--save-at', type=int, nargs='*', default=[])
+    p.add_argument('--nvfp4', action='store_true',
+                   help='Dust: reruns through the linear layers as a delta forward on NVFP4 tensor cores (yoco/nvfp4.py; '
+                        'Blackwell GPUs only)')
+    p.add_argument('--nvfp4-skip', type=int, nargs='*', default=[], help='with --nvfp4: blocks kept in full precision')
     p.add_argument('--count-flops', action='store_true',
                    help='count the floating-point operations of step 2 (run uncompiled) and of one forward pass; '
                         'logged as flops_per_token, flops_forward_per_token, flops_ratio; breakdown in flops.json')
@@ -262,6 +266,8 @@ def main():
                           credit=args.credit, attn_c=args.attn_c,
                           res_gamma=args.res_gamma, res_blocks=args.res_blocks)
         estimator.set_precision('tf32' if args.fp32 else args.precision)
+        if args.nvfp4:
+            estimator.enable_nvfp4(skip_blocks=set(args.nvfp4_skip))
         estimator.truncate = not args.no_truncate
         estimator.kv_credit = args.kv_credit
         estimator.pool = args.pool or (bool(args.chain) and not args.chain_own)
@@ -521,7 +527,7 @@ def main():
             torch.cuda.synchronize()
             prof.__exit__(None, None, None)
             ka = prof.key_averages()
-            print(ka.table(sort_by='cuda_time_total', row_limit=40, max_name_column_width=70), flush=True)
+            print(ka.table(sort_by=os.environ.get('DUST_PROFILE_SORT', 'cuda_time_total'), row_limit=40, max_name_column_width=70), flush=True)
             if os.environ.get('DUST_PROFILE_CPU'):
                 for e_ in sorted([e_ for e_ in ka if e_.key.startswith('dust.')], key=lambda e_: -e_.device_time_total):
                     print(f'PHASE {e_.key:24s} gpu {e_.device_time_total / 1e3:9.1f} ms  cpu {e_.cpu_time_total / 1e3:9.1f} ms  calls {e_.count}', flush=True)

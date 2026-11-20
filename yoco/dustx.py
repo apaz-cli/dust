@@ -187,6 +187,45 @@ class DustX(DUST):
             for ve in self.model.value_embeds.values():
                 ve.float()
 
+    def enable_nvfp4(self, skip_blocks=()):
+        """Reruns through every linear layer in the blocks (and YOCO's cache projections) as a *delta forward* on
+        NVFP4 tensor cores: output = clean output + FP4(input - clean input) @ FP4(W).T (yoco/nvfp4.py). The clean
+        pass runs as before and records each linear's input and output; a rerun only quantizes the change its
+        perturbation caused, so the 4-bit rounding error scales with that change, not with the activation. The
+        routed experts (grouped matmul), the embedding, the head and the attention itself stay as they were.
+        skip_blocks: block indices kept in full precision."""
+        from yoco import nvfp4
+        self.fp4_clean = {}
+        self.nvfp4_on = True
+        for name, mod in self.model.named_modules():
+            if not isinstance(mod, nn.Linear) or not name.startswith('transformer.') or name.endswith('ve_gate'):
+                continue
+            if name.startswith('transformer.h.') and int(name.split('.')[2]) in skip_blocks:
+                continue
+            if mod.in_features % 32 or mod.out_features % 16:
+                continue
+            orig = mod.forward
+            fp32_out = name.endswith('c_proj')
+
+            def fwd(x, mod=mod, name=name, orig=orig, fp32_out=fp32_out):
+                if self.capturing or not self.nvfp4_on or torch.is_grad_enabled() or name not in self.fp4_clean:
+                    y = orig(x)
+                    if self.capturing:  # clean input and output, the delta's scale, the weight quantized once
+                        xc = x.reshape(-1, x.shape[-1]).detach()
+                        wq = nvfp4.quantize_fast(mod.weight.detach())
+                        self.fp4_clean[name] = (xc, y.reshape(-1, y.shape[-1]).detach(), nvfp4.delta_scale(xc),
+                                                wq.data, wq.scale, wq.gscale.reshape(1))
+                    return y
+                xc, yc, g, wd, ws, wg = self.fp4_clean[name]
+                if x.shape[-1] != xc.shape[-1] or (x.numel() // x.shape[-1]) % xc.shape[0]:
+                    return orig(x)
+                out = nvfp4.delta_linear_q(x, xc, yc, g, wd, ws, wg)
+                return out if fp32_out else out.to(self._fp4_dtype())
+            mod.forward = fwd
+
+    def _fp4_dtype(self):
+        return torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else torch.float32
+
     # ---- rewards -------------------------------------------------------------------------------
     def capture(self, x, y):
         """Clean pass that also records the stream entering every block, for truncated draws."""

@@ -14,7 +14,8 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
-BM, BN, BK = 64, 64, 32
+BM, BN, BK = 64, 256, 64  # tuned on the RTX 5090 at the expert shapes (65536 x 512 x 768 and back): about 187 TFLOP/s
+NUM_WARPS, NUM_STAGES = 4, 2
 
 
 @triton.jit
@@ -69,5 +70,6 @@ def gmm(a: torch.Tensor, b: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
     grid = (te.shape[0], triton.cdiv(N, BN))
     wrap_triton(_gmm_kernel)[grid](a, b, out, te, r0, r1, N, K,
                                    a.stride(0), a.stride(1), b.stride(0), b.stride(1), b.stride(2),
-                                   out.stride(0), out.stride(1), BM=BM, BN=BN, BK=BK)
+                                   out.stride(0), out.stride(1), BM=BM, BN=BN, BK=BK,
+                                   num_warps=NUM_WARPS, num_stages=NUM_STAGES)
     return out
