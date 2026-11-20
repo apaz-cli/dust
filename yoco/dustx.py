@@ -224,6 +224,20 @@ class DustX(DUST):
                 return out if fp32_out else out.to(self._fp4_dtype())
             mod.forward = fwd
 
+    def set_local_amp(self, dtype):
+        """Run the local estimators (leak-free key/value/query scoring, the attention-output probes) under autocast:
+        their matmuls and einsums in 16 bits (fp32 accumulation), softmax and the closed-form score arithmetic still
+        fp32. They were fp32 throughout (about 0.9 s of TF32 matmuls in a 7 s MoE step at width 512)."""
+        import functools
+        for name in ('zo_cross', 'zo_self_local', 'local_proj'):
+            fn = getattr(type(self), name)
+
+            @functools.wraps(fn)
+            def wrapped(*a, fn=fn, **kw):
+                with torch.autocast('cuda', dtype=dtype):
+                    return fn(self, *a, **kw)
+            setattr(self, name, wrapped)
+
     def _fp4_dtype(self):
         return torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else torch.float32
 

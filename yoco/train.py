@@ -182,6 +182,8 @@ def main():
     p.add_argument('--nvfp4', action='store_true',
                    help='Dust: reruns through the linear layers as a delta forward on NVFP4 tensor cores (yoco/nvfp4.py; '
                         'Blackwell GPUs only)')
+    p.add_argument('--local-amp', choices=['none', 'bf16', 'fp16'], default='none',
+                   help='Dust: the local estimators (leak-free scoring, attention-output probes) with 16-bit matmuls')
     p.add_argument('--nvfp4-experts', action='store_true', help='with --nvfp4: the routed experts too (delta forward)')
     p.add_argument('--nvfp4-skip', type=int, nargs='*', default=[], help='with --nvfp4: blocks kept in full precision')
     p.add_argument('--count-flops', action='store_true',
@@ -267,6 +269,8 @@ def main():
                           credit=args.credit, attn_c=args.attn_c,
                           res_gamma=args.res_gamma, res_blocks=args.res_blocks)
         estimator.set_precision('tf32' if args.fp32 else args.precision)
+        if args.local_amp != 'none':
+            estimator.set_local_amp(dict(bf16=torch.bfloat16, fp16=torch.float16)[args.local_amp])
         if args.nvfp4:
             estimator.enable_nvfp4(skip_blocks=set(args.nvfp4_skip), experts=args.nvfp4_experts)
         estimator.truncate = not args.no_truncate
