@@ -182,8 +182,9 @@ def main():
     p.add_argument('--nvfp4', action='store_true',
                    help='Dust: reruns through the linear layers as a delta forward on NVFP4 tensor cores (yoco/nvfp4.py; '
                         'Blackwell GPUs only)')
-    p.add_argument('--local-amp', choices=['none', 'bf16', 'fp16'], default='none',
-                   help='Dust: the local estimators (leak-free scoring, attention-output probes) with 16-bit matmuls')
+    p.add_argument('--local-amp', choices=['none', 'bf16', 'fp16'], default='fp16',
+                   help='Dust: the local estimators (leak-free scoring, attention-output probes) with 16-bit matmuls; '
+                        'fp16 is the default since 20 November (1500 steps: 4.491 against 4.487 in fp32; bf16 cost 0.015)')
     p.add_argument('--nvfp4-experts', action='store_true', help='with --nvfp4: the routed experts too (delta forward)')
     p.add_argument('--nvfp4-skip', type=int, nargs='*', default=[], help='with --nvfp4: blocks kept in full precision')
     p.add_argument('--count-flops', action='store_true',
