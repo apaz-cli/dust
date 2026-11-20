@@ -175,17 +175,34 @@ class MoE(nn.Module):
         pre = torch.einsum('nd,ehd->neh', xf.to(dt), self.w_fc.to(dt)).float()           # [N, E, h]
         hid = F.relu(pre).square()
         y = torch.einsum('neh,edh->ned', hid.to(dt), self.w_proj.to(dt)).float()          # [N, E, d]
-        self.fp4_cache = dict(N=xf.shape[0], x=xf.float(), pre=pre, hid=hid, y=y,
-                              fc=nvfp4.fake_quant_rows(self.w_fc.reshape(-1, self.w_fc.shape[-1])).view_as(self.w_fc).to(dt),
-                              proj=nvfp4.fake_quant_rows(self.w_proj.reshape(-1, self.w_proj.shape[-1])).view_as(self.w_proj).to(dt))
+        self.fp4_cache = dict(N=xf.shape[0], x=xf.float(), pre=pre, hid=hid, y=y)
+        if self._mx_ok():  # real 4-bit: the weights quantized to MXFP4 once (w_fc is [E, h, d] = [E, N, K], as needed)
+            from yoco.gmm import mx_quant
+            for which, Wt in (('fc', self.w_fc), ('proj', self.w_proj)):
+                E_, N_, K_ = Wt.shape
+                q, sc = mx_quant(Wt.detach().reshape(E_ * N_, K_).contiguous())
+                self.fp4_cache[which] = (q.view(E_, N_, K_ // 2), sc.view(E_, N_, K_ // 32))
+        else:  # emulated NVFP4
+            self.fp4_cache['fc'] = nvfp4.fake_quant_rows(self.w_fc.reshape(-1, self.w_fc.shape[-1])).view_as(self.w_fc).to(dt)
+            self.fp4_cache['proj'] = nvfp4.fake_quant_rows(self.w_proj.reshape(-1, self.w_proj.shape[-1])).view_as(self.w_proj).to(dt)
+
+    def _mx_ok(self):
+        """Real 4-bit expert matmuls (MXFP4 through Triton's tl.dot_scaled) on Blackwell GPUs, with K a multiple of the
+        kernel's block."""
+        from yoco.gmm import MX_BK
+        return torch.cuda.get_device_capability()[0] >= 10 and self.w_fc.shape[-1] % MX_BK == 0 \
+            and self.w_proj.shape[-1] % MX_BK == 0
 
     def _fp4_mm(self, delta, which, offs, dt):
-        """The change's matmul through the routed experts in NVFP4: the change quantized in 1 x 16 blocks along its
-        input dimension, the weight quantized once per clean pass. Emulated (quantize, dequantize, our fp16 grouped
-        matmul): numerically what an FP4 tensor-core grouped matmul computes, not yet its speed."""
+        """The change's matmul through the routed experts in 4 bits, the weight quantized once per clean pass. On
+        Blackwell GPUs a real MXFP4 grouped matmul (yoco/gmm.py: 32-value blocks, power-of-two scales, Triton's
+        tensor-core scaled dot); elsewhere NVFP4 emulated (quantize, dequantize, our fp16 grouped matmul)."""
         from yoco import nvfp4
-        from yoco.gmm import gmm
+        from yoco.gmm import gmm, gmm_mx, mx_quant
         W = self.fp4_cache[which]
+        if isinstance(W, tuple):
+            q, sc = mx_quant(delta.contiguous())
+            return gmm_mx(q, sc, W[0], W[1], offs)
         return gmm(nvfp4.fake_quant_rows(delta).to(dt), W.transpose(1, 2), offs)
 
     def _sparse(self, x, xf, N, ids, w, sel, est, prefix):
