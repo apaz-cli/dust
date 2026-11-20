@@ -261,3 +261,19 @@ def delta_linear_q(x, x_clean, y_clean, g, w_data, w_scale, w_g):
     n = X.shape[0] // y_clean.shape[0]
     out = y_clean.float().repeat(n, 1) + d.float() * (g * w_g)
     return out.view(*x.shape[:-1], -1)
+
+
+def fake_quant_rows(x):
+    """NVFP4 round trip in plain torch (traceable): x [rows, K] -> the fp32 values an FP4 matmul would see, quantized in
+    1 x 16 blocks along K with a per-tensor scale."""
+    rows, K = x.shape
+    xf = x.float()
+    g = (xf.abs().amax() / (E2M1_MAX * E4M3_MAX)).clamp(min=1e-30)
+    xb = xf.view(rows, K // BLOCK, BLOCK)
+    s = (xb.abs().amax(-1, keepdim=True) / (E2M1_MAX * g)).clamp(max=E4M3_MAX).to(torch.float8_e4m3fn).float()
+    sf = s.clamp(min=1e-30) * g
+    a = (xb / sf).abs()
+    bounds = torch.tensor(_BOUNDS, device=x.device)
+    grid = torch.tensor(_GRID, device=x.device)
+    v = grid[torch.bucketize(a, bounds)] * torch.sign(xb)
+    return (v * sf).view(rows, K)

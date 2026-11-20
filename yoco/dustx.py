@@ -187,7 +187,7 @@ class DustX(DUST):
             for ve in self.model.value_embeds.values():
                 ve.float()
 
-    def enable_nvfp4(self, skip_blocks=()):
+    def enable_nvfp4(self, skip_blocks=(), experts=False):
         """Reruns through every linear layer in the blocks (and YOCO's cache projections) as a *delta forward* on
         NVFP4 tensor cores: output = clean output + FP4(input - clean input) @ FP4(W).T (yoco/nvfp4.py). The clean
         pass runs as before and records each linear's input and output; a rerun only quantizes the change its
@@ -197,6 +197,7 @@ class DustX(DUST):
         from yoco import nvfp4
         self.fp4_clean = {}
         self.nvfp4_on = True
+        self.nvfp4_experts = experts  # routed experts too (yoco/moe.py, MoE._fp4_capture)
         for name, mod in self.model.named_modules():
             if not isinstance(mod, nn.Linear) or not name.startswith('transformer.') or name.endswith('ve_gate'):
                 continue
@@ -1380,6 +1381,10 @@ class DustX(DUST):
     def finish(self, x, y, optimizer, errors):
         r = self.settings
         grads = {}
+        if getattr(self, 'nvfp4_on', False):  # the reruns are done: drop the clean values the delta forward used, so no
+            self.fp4_clean = {}               # later forward (evaluation, a probe) reads another batch's clean values
+            for m in self.modules_moe.values():
+                m.fp4_cache = None
         if os.environ.get('DUST_DEBUG'):
             print({s: round(e.float().norm().item(), 4) for s, e in errors.items()
                    if s.endswith('c_proj') or s.endswith('c_fc') or s == 'transformer.wte'}, flush=True)

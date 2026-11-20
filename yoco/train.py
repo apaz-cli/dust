@@ -182,6 +182,7 @@ def main():
     p.add_argument('--nvfp4', action='store_true',
                    help='Dust: reruns through the linear layers as a delta forward on NVFP4 tensor cores (yoco/nvfp4.py; '
                         'Blackwell GPUs only)')
+    p.add_argument('--nvfp4-experts', action='store_true', help='with --nvfp4: the routed experts too (delta forward)')
     p.add_argument('--nvfp4-skip', type=int, nargs='*', default=[], help='with --nvfp4: blocks kept in full precision')
     p.add_argument('--count-flops', action='store_true',
                    help='count the floating-point operations of step 2 (run uncompiled) and of one forward pass; '
@@ -267,7 +268,7 @@ def main():
                           res_gamma=args.res_gamma, res_blocks=args.res_blocks)
         estimator.set_precision('tf32' if args.fp32 else args.precision)
         if args.nvfp4:
-            estimator.enable_nvfp4(skip_blocks=set(args.nvfp4_skip))
+            estimator.enable_nvfp4(skip_blocks=set(args.nvfp4_skip), experts=args.nvfp4_experts)
         estimator.truncate = not args.no_truncate
         estimator.kv_credit = args.kv_credit
         estimator.pool = args.pool or (bool(args.chain) and not args.chain_own)

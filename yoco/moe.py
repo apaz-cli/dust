@@ -29,6 +29,7 @@ class MoE(nn.Module):
         self.register_buffer('load', torch.zeros(experts))  # tokens routed per expert, accumulated since last update
         self.dust = None
         self.cap = 0.0        # soft cap on router logits (0: off)
+        self.fp4_cache = None  # NVFP4 experts: clean per-expert values for the delta forward (see _fp4_capture)
         self.probe = None     # yoco/noise_probe.py: a dict that receives the pre-activations and gate logits to keep grads of
         self.dense = False    # compute every expert for every token, keep the routed ones: fixed shapes, compilable
         self.grouped = False  # routed experts by one grouped matmul over the slots sorted by expert: fixed shapes, compilable
@@ -134,7 +135,17 @@ class MoE(nn.Module):
         inv = order.argsort()
         tok = order // self.k                                         # the token of each sorted slot
         offs = torch.cumsum(self._counts(ids), 0).to(torch.int32)     # end of each expert's group
-        pre = gmm(xf[tok].to(dt), self.w_fc.to(dt).transpose(1, 2), offs)[inv]
+        fp4 = est is not None and getattr(est, 'nvfp4_on', False) and getattr(est, 'nvfp4_experts', False)
+        if fp4 and est.capturing:
+            self._fp4_capture(xf, dt)
+        delta = fp4 and self.fp4_cache is not None and N % self.fp4_cache['N'] == 0
+        if delta:  # delta forward (yoco/nvfp4.py): clean output of the routed expert + FP4 change
+            c = self.fp4_cache
+            tc = tok % c['N']                                         # the clean token of each sorted slot
+            e_s = flat_ids[order]                                     # the expert of each sorted slot
+            pre = (c['pre'][tc, e_s] + self._fp4_mm(xf[tok] - c['x'][tc], 'fc', offs, dt))[inv]
+        else:
+            pre = gmm(xf[tok].to(dt), self.w_fc.to(dt).transpose(1, 2), offs)[inv]
         if est is not None and prefix + 'moe' in est.jitter:
             pre = pre + est.jitter[prefix + 'moe'].reshape(N * self.k, self.h).to(pre.dtype)
         hid = F.relu(pre).square()
@@ -145,10 +156,37 @@ class MoE(nn.Module):
             est.inputs[prefix + 'moe'] = xf.float()
             est.inputs[prefix + 'hid'] = hid.float().view(N, self.k, self.h)
             est.inputs[prefix + 'w'] = w.reshape(N, self.k)
-        Y = gmm(hid[order].to(dt), self.w_proj.to(dt).transpose(1, 2), offs)          # [N*k, d], sorted order
+        if delta:
+            hs = hid[order]
+            Y = c['y'][tc, e_s] + self._fp4_mm(hs - c['hid'][tc, e_s], 'proj', offs, dt)
+        else:
+            Y = gmm(hid[order].to(dt), self.w_proj.to(dt).transpose(1, 2), offs)      # [N*k, d], sorted order
         out = torch.zeros(N, d, device=x.device, dtype=torch.float32)
         out.index_add_(0, tok, Y * w.reshape(-1)[order, None])
         return out
+
+    @torch.no_grad()
+    def _fp4_capture(self, xf, dt):
+        """Clean pass with NVFP4 experts: every expert's pre-activation, hidden units and output for every clean token
+        (E/k times the experts' work, in one pass out of hundreds), so a rerun's delta forward can start from the clean
+        values of whichever expert a token is routed to, even when its routing changed; and the weights quantized once.
+        The clean pass itself then reads its values from here too, so clean and reruns use the same arithmetic."""
+        from yoco import nvfp4
+        pre = torch.einsum('nd,ehd->neh', xf.to(dt), self.w_fc.to(dt)).float()           # [N, E, h]
+        hid = F.relu(pre).square()
+        y = torch.einsum('neh,edh->ned', hid.to(dt), self.w_proj.to(dt)).float()          # [N, E, d]
+        self.fp4_cache = dict(N=xf.shape[0], x=xf.float(), pre=pre, hid=hid, y=y,
+                              fc=nvfp4.fake_quant_rows(self.w_fc.reshape(-1, self.w_fc.shape[-1])).view_as(self.w_fc).to(dt),
+                              proj=nvfp4.fake_quant_rows(self.w_proj.reshape(-1, self.w_proj.shape[-1])).view_as(self.w_proj).to(dt))
+
+    def _fp4_mm(self, delta, which, offs, dt):
+        """The change's matmul through the routed experts in NVFP4: the change quantized in 1 x 16 blocks along its
+        input dimension, the weight quantized once per clean pass. Emulated (quantize, dequantize, our fp16 grouped
+        matmul): numerically what an FP4 tensor-core grouped matmul computes, not yet its speed."""
+        from yoco import nvfp4
+        from yoco.gmm import gmm
+        W = self.fp4_cache[which]
+        return gmm(nvfp4.fake_quant_rows(delta).to(dt), W.transpose(1, 2), offs)
 
     def _sparse(self, x, xf, N, ids, w, sel, est, prefix):
         """Routed experts on padded per-expert batches (sorts the tokens; the largest batch is read back to the host)."""
