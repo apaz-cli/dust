@@ -527,6 +527,8 @@ def main():
         if prof is not None and step == prof_at + 1:
             torch.cuda.synchronize()
             prof.__exit__(None, None, None)
+            if os.environ.get('DUST_PROFILE_TRACE'):
+                prof.export_chrome_trace(os.environ['DUST_PROFILE_TRACE'])
             ka = prof.key_averages()
             print(ka.table(sort_by=os.environ.get('DUST_PROFILE_SORT', 'cuda_time_total'), row_limit=40, max_name_column_width=70), flush=True)
             if os.environ.get('DUST_PROFILE_CPU'):

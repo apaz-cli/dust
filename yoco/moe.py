@@ -113,6 +113,22 @@ class MoE(nn.Module):
         return out.to(x.dtype)
 
 
+    def _sort_by_expert(self, flat_ids):
+        """The stable sort of the token slots by expert, as a counting sort: a slot's position is its expert's start
+        plus its rank among that expert's slots (a cumulative sum over a [slots, E] one-hot). Same result as
+        argsort(stable=True), without a radix sort (tens of thousands of tiny kernels per step). Returns
+        order (sorted slot -> slot), inv (slot -> sorted position) and the counts per expert."""
+        if flat_ids.is_cuda and self.E & (self.E - 1) == 0:           # Triton version (yoco/gmm.py), E a power of two
+            from yoco.gmm import sort_by_expert
+            return sort_by_expert(flat_ids.contiguous(), self.E)
+        S = flat_ids.shape[0]
+        onehot = F.one_hot(flat_ids, self.E).to(torch.int32)          # [S, E]
+        counts = onehot.sum(0).to(torch.int64)
+        rank = (torch.cumsum(onehot, 0) - onehot).gather(1, flat_ids[:, None]).squeeze(1).to(torch.int64)
+        inv = (torch.cumsum(counts, 0) - counts)[flat_ids] + rank
+        order = torch.empty_like(inv).scatter_(0, inv, torch.arange(S, device=flat_ids.device))
+        return order, inv, counts
+
     def _counts(self, ids):
         """Tokens per expert, [E] int64; a fixed-size output (bincount's size depends on the data, which breaks compile)."""
         flat = ids.reshape(-1)
@@ -131,10 +147,9 @@ class MoE(nn.Module):
         B, T, d = x.shape
         dt = self._mm_dtype(x)
         flat_ids = ids.reshape(-1)                                    # [N*k], slot-major per token
-        order = flat_ids.argsort(stable=True)
-        inv = order.argsort()
+        order, inv, counts = self._sort_by_expert(flat_ids)
         tok = order // self.k                                         # the token of each sorted slot
-        offs = torch.cumsum(self._counts(ids), 0).to(torch.int32)     # end of each expert's group
+        offs = torch.cumsum(counts, 0).to(torch.int32)                # end of each expert's group
         fp4 = est is not None and getattr(est, 'nvfp4_on', False) and getattr(est, 'nvfp4_experts', False)
         if fp4 and est.capturing:
             self._fp4_capture(xf, dt)

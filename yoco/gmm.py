@@ -166,3 +166,49 @@ def gmm_mx(aq: torch.Tensor, a_s: torch.Tensor, bq: torch.Tensor, b_s: torch.Ten
     wrap_triton(_gmm_mx_kernel)[(te.shape[0], triton.cdiv(N, MX_BN))](aq, a_s, bq, b_s, out, te, r0, r1, N, K,
                                                                       BM=BM, BN=MX_BN, BK=MX_BK, num_warps=4)
     return out
+
+
+# ---- stable sort of the token slots by expert (a counting sort in two Triton kernels) ------------------------------
+SORT_CHUNK = 1024
+
+
+@triton.jit
+def _expert_count_kernel(ids_ptr, cnt_ptr, S, E: tl.constexpr, CH: tl.constexpr):
+    c = tl.program_id(0)
+    i = c * CH + tl.arange(0, CH)
+    e = tl.load(ids_ptr + i, mask=i < S, other=E)                       # E: padding, counted nowhere
+    oh = (e[:, None] == tl.arange(0, E)[None, :]).to(tl.int32)         # [CH, E]
+    tl.store(cnt_ptr + c * E + tl.arange(0, E), tl.sum(oh, 0))
+
+
+@triton.jit
+def _expert_place_kernel(ids_ptr, base_ptr, order_ptr, inv_ptr, S, E: tl.constexpr, CH: tl.constexpr):
+    c = tl.program_id(0)
+    i = c * CH + tl.arange(0, CH)
+    ok = i < S
+    e = tl.load(ids_ptr + i, mask=ok, other=0)
+    oh = (e[:, None] == tl.arange(0, E)[None, :]).to(tl.int32)         # [CH, E]
+    rank = tl.sum((tl.cumsum(oh, 0) - oh) * oh, 1)                     # rank among this chunk's slots of its expert
+    base = tl.load(base_ptr + c * E + e, mask=ok, other=0)              # where this chunk's slots of that expert start
+    pos = base + rank
+    tl.store(inv_ptr + i, pos, mask=ok)
+    tl.store(order_ptr + pos, i.to(tl.int64), mask=ok)
+
+
+@triton_op("dust::sort_by_expert", mutates_args=())
+def sort_by_expert(ids: torch.Tensor, E: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ids [S] (int64, values in 0..E-1, E a power of two) -> (order, inv, counts): the stable sort by expert,
+    as argsort(stable=True) gives it, its inverse, and the slots per expert."""
+    S = ids.shape[0]
+    CH = max(64, SORT_CHUNK * 8 // max(E, 8))                           # [CH, E] must fit in shared memory
+    nch = triton.cdiv(S, CH)
+    cnt = torch.empty(nch, E, device=ids.device, dtype=torch.int32)
+    wrap_triton(_expert_count_kernel)[(nch,)](ids, cnt, S, E=E, CH=CH)
+    counts = cnt.sum(0).to(torch.int64)
+    start = torch.cumsum(counts, 0) - counts                            # each expert's first position
+    before = torch.cumsum(cnt, 0) - cnt                                 # that expert's slots in earlier chunks
+    base = (start[None, :] + before).to(torch.int64).contiguous()
+    order = torch.empty(S, device=ids.device, dtype=torch.int64)
+    inv = torch.empty(S, device=ids.device, dtype=torch.int64)
+    wrap_triton(_expert_place_kernel)[(nch,)](ids, base, order, inv, S, E=E, CH=CH)
+    return order, inv, counts
