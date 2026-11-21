@@ -185,6 +185,7 @@ def main():
     p.add_argument('--local-amp', choices=['none', 'bf16', 'fp16'], default='fp16',
                    help='Dust: the local estimators (leak-free scoring, attention-output probes) with 16-bit matmuls; '
                         'fp16 is the default since 20 November (1500 steps: 4.491 against 4.487 in fp32; bf16 cost 0.015)')
+    p.add_argument('--nvfp4-head', action='store_true', help='with --nvfp4: the output head in the reruns too')
     p.add_argument('--nvfp4-experts', action='store_true', help='with --nvfp4: the routed experts too (delta forward)')
     p.add_argument('--nvfp4-skip', type=int, nargs='*', default=[], help='with --nvfp4: blocks kept in full precision')
     p.add_argument('--count-flops', action='store_true',
@@ -273,7 +274,7 @@ def main():
         if args.local_amp != 'none':
             estimator.set_local_amp(dict(bf16=torch.bfloat16, fp16=torch.float16)[args.local_amp])
         if args.nvfp4:
-            estimator.enable_nvfp4(skip_blocks=set(args.nvfp4_skip), experts=args.nvfp4_experts)
+            estimator.enable_nvfp4(skip_blocks=set(args.nvfp4_skip), experts=args.nvfp4_experts, head=args.nvfp4_head)
         estimator.truncate = not args.no_truncate
         estimator.kv_credit = args.kv_credit
         estimator.pool = args.pool or (bool(args.chain) and not args.chain_own)
@@ -527,13 +528,16 @@ def main():
             from torch.profiler import ProfilerActivity, profile
             torch.cuda.synchronize()
             prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if os.environ.get('DUST_PROFILE_CPU')
-                           else [ProfilerActivity.CUDA])
+                           else [ProfilerActivity.CUDA], with_stack=bool(os.environ.get('DUST_PROFILE_STACK')))
             prof.__enter__()
         if prof is not None and step == prof_at + 1:
             torch.cuda.synchronize()
             prof.__exit__(None, None, None)
             if os.environ.get('DUST_PROFILE_TRACE'):
                 prof.export_chrome_trace(os.environ['DUST_PROFILE_TRACE'])
+            if os.environ.get('DUST_PROFILE_STACK'):  # the source lines behind the most expensive operations
+                print(prof.key_averages(group_by_stack_n=6).table(sort_by='self_cuda_time_total', row_limit=25,
+                                                                  max_name_column_width=60), flush=True)
             ka = prof.key_averages()
             print(ka.table(sort_by=os.environ.get('DUST_PROFILE_SORT', 'cuda_time_total'), row_limit=40, max_name_column_width=70), flush=True)
             if os.environ.get('DUST_PROFILE_CPU'):

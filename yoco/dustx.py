@@ -187,7 +187,7 @@ class DustX(DUST):
             for ve in self.model.value_embeds.values():
                 ve.float()
 
-    def enable_nvfp4(self, skip_blocks=(), experts=False):
+    def enable_nvfp4(self, skip_blocks=(), experts=False, head=False):
         """Reruns through every linear layer in the blocks (and YOCO's cache projections) as a *delta forward* on
         NVFP4 tensor cores: output = clean output + FP4(input - clean input) @ FP4(W).T (yoco/nvfp4.py). The clean
         pass runs as before and records each linear's input and output; a rerun only quantizes the change its
@@ -197,16 +197,18 @@ class DustX(DUST):
         from yoco import nvfp4
         self.fp4_clean = {}
         self.nvfp4_on = True
+        self.nvfp4_head = head  # the output head too (in the reruns: clean logits + the FP4 change)
         self.nvfp4_experts = experts  # routed experts too (yoco/moe.py, MoE._fp4_capture)
         for name, mod in self.model.named_modules():
-            if not isinstance(mod, nn.Linear) or not name.startswith('transformer.') or name.endswith('ve_gate'):
+            if not isinstance(mod, nn.Linear) or name.endswith('ve_gate') \
+                    or not (name.startswith('transformer.') or (name == 'lm_head' and self.nvfp4_head)):
                 continue
             if name.startswith('transformer.h.') and int(name.split('.')[2]) in skip_blocks:
                 continue
             if mod.in_features % 32 or mod.out_features % 16:
                 continue
             orig = mod.forward
-            fp32_out = name.endswith('c_proj')
+            fp32_out = name.endswith('c_proj') or name == 'lm_head'  # those return fp32 under fast16
 
             def fwd(x, mod=mod, name=name, orig=orig, fp32_out=fp32_out):
                 if self.capturing or not self.nvfp4_on or torch.is_grad_enabled() or name not in self.fp4_clean:
@@ -819,7 +821,14 @@ class DustX(DUST):
         return (self.attn_c * t * P).clamp(max=1.0)
 
     @staticmethod
-    def separate_scores(kind, P, eo, values, base, credit, dk=None, dv=None, qp=None, ev=None, eb=None):
+    def value_weights(P, eo, credit):
+        """For value-like jitters (kind 'v', 've', 'gate') the leak-free score is linear in the change dv, so
+        sum_u credit[s,u] eo_u . (P_us dv_s) = dv_s . M_s with M[b,h,s,d] = sum_u P[b,h,u,s] credit[s,u] eo[b,u,h,d]:
+        draw-independent, computed once per layer, so a draw costs a dot product instead of a [n,b,h,T,T] tensor."""
+        return torch.einsum('bhus,buhd->bhsd', P * credit.t(), eo)
+
+    @staticmethod
+    def separate_scores(kind, P, eo, values, base, credit, dk=None, dv=None, qp=None, ev=None, eb=None, M=None):
         """Leak-free local scores: every token's jitter scored on its own, all T experiments in one T x T pass.
 
         P [b,h,u,s] clean attention probabilities (masked entries 0), eo [b,u,h,d] o@ error targets,
@@ -838,6 +847,8 @@ class DustX(DUST):
                 eb = torch.einsum('buhd,buhd->bhu', eo, base)
             S = r / (1 + r) * (ev - eb[..., None])
         else:
+            if M is not None:  # the same scores through value_weights (exact; no T x T tensor per draw)
+                return torch.einsum('nbshd,bhsd->nbsh', dv, M)
             S = P * torch.einsum('buhd,nbshd->nbhus', eo, dv)
         return torch.einsum('nbhus,su->nbsh', S, credit)
 
@@ -950,7 +961,10 @@ class DustX(DUST):
                             dv = sigma * a.view(n, b, t, h, d)
                             if kind == 've':
                                 dv = dv * (2 * torch.sigmoid(z)).unsqueeze(-1)
-                        score = compiled(DustX.separate_scores)(kind, P, eo, vf, of, credit, dv=dv.float())
+                        if ('M', i) not in sep_e:
+                            sep_e[('M', i)] = DustX.value_weights(P, eo, credit)
+                        score = compiled(DustX.separate_scores)(kind, P, eo, vf, of, credit, dv=dv.float(),
+                                                                M=sep_e[('M', i)])
                     estimate = torch.einsum('nbth,nbthd->bthd', score, a.view(n, b, t, h, -1))
                     errors[i] += estimate.reshape(b, t, width) / divisor
                     continue
@@ -1038,7 +1052,7 @@ class DustX(DUST):
                 of = torch.einsum('bhus,bshd->buhd', P, vf)
                 eo = targets[i].float().view(b, t, h, d)
                 extra = (torch.einsum('buhd,bshd->bhus', eo, vf), torch.einsum('buhd,buhd->bhu', eo, of)) \
-                    if kind == 'k' else (None, None)
+                    if kind == 'k' else (DustX.value_weights(P, eo, credit), None)   # for 'v': the weights M
                 layer[i] = P, eo, of, extra
             kf = self._processed(kr, t).float()
             err = torch.zeros(b, t, cfg.n_embd, device=self.device)
@@ -1055,7 +1069,7 @@ class DustX(DUST):
                                                              ev=ev, eb=eb)
                     else:
                         score = score + compiled(DustX.separate_scores)('v', P, eo, vf, of, credit,
-                                                             dv=sigma * a.view(n, b, t, h, d))
+                                                             dv=sigma * a.view(n, b, t, h, d), M=ev)
                 err += torch.einsum('nbth,nbthd->bthd', score, a.view(n, b, t, h, d)).reshape(b, t, -1) / sigma
             return {f'transformer.cache_{kind}': err / draws}
         if kind == 'q':
@@ -1174,10 +1188,14 @@ class DustX(DUST):
         W = self.modules[f'transformer.h.{layer}.attn.c_proj'].weight.float()
         b, t, d = target.shape
         est = torch.zeros(b, t, W.shape[1], device=self.device)
-        for _ in range(draws // n):
-            a = torch.randn(n, b, t, W.shape[1], device=self.device, generator=self.generator)
-            score = torch.einsum('btd,nbtd->nbt', target, (sigma * a) @ W.t())
-            est += torch.einsum('nbt,nbtf->btf', score, a) / sigma
+        # target . (sigma a W^T) = sigma a . (target W): the projection applied once to the target instead of to
+        # every draw (the same arithmetic reordered; no per-draw matmul, no casts)
+        with torch.autocast('cuda', enabled=False):
+            u = target.float() @ W                                            # [b, t, f]
+            for _ in range(draws // n):
+                a = torch.randn(n, b, t, W.shape[1], device=self.device, generator=self.generator)
+                score = (a * u).sum(-1)                                       # [n, b, t]; times sigma, divided below
+                est += (score.unsqueeze(-1) * a).sum(0)
         return est / draws
 
     # ---- residual pooling --------------------------------------------------------------------------
